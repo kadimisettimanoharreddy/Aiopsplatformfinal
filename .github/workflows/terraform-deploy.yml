@@ -10,216 +10,329 @@ on:
 
 jobs:
   deploy:
-    # only run when the PR was merged
     if: github.event.pull_request.merged == true
     runs-on: ubuntu-latest
 
+    env:
+      API_URL: ${{ secrets.API_URL }}          # e.g. https://b5c78943d402.ngrok-free.app
+      API_TOKEN: ${{ secrets.API_TOKEN }}      # optional, used as Bearer token if set
+      AWS_REGION: us-east-1
+
     steps:
-    - name: Checkout (full history)
-      uses: actions/checkout@v4
-      with:
-        fetch-depth: 0
+      - name: Checkout (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-    - name: Setup Terraform CLI
-      uses: hashicorp/setup-terraform@v2
-      with:
-        terraform_version: 1.5.0
-        terraform_wrapper: false
+      - name: Setup Terraform CLI
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: 1.5.0
+          terraform_wrapper: false
 
-    - name: Configure AWS credentials
-      uses: aws-actions/configure-aws-credentials@v2
-      with:
-        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        aws-region: us-east-1
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
 
-    - name: Detect changed tfvars
-      id: detect
-      run: |
-        set -euo pipefail
-        echo "Detecting changed .tfvars files... (trying HEAD~1..HEAD, falling back to origin/main..HEAD)"
+      - name: Detect changed tfvars
+        id: detect
+        run: |
+          set -euo pipefail
+          echo "Trying HEAD~1..HEAD diff; falling back to origin/main if needed"
+          changed=$(git diff --name-only HEAD~1 HEAD || true)
+          if [ -z "$changed" ]; then
+            git fetch origin main --depth=1 || git fetch origin main
+            changed=$(git diff --name-only origin/main HEAD || true)
+          fi
 
-        # Try diff between HEAD~1 and HEAD
-        changed=$(git diff --name-only HEAD~1 HEAD || true)
+          # filter for env aws requests tfvars (both repo layouts)
+          tfvars_files=$(printf "%s\n" "$changed" | grep -E '(^|/)(environments/aws|backend/terraform/environments/aws)/[^/]+/requests/[^/]+\.tfvars$' || true)
 
-        if [ -z "$changed" ]; then
-          echo "No local HEAD~1; fetching origin/main to compare..."
-          git fetch origin main --depth=1 || git fetch origin main
-          changed=$(git diff --name-only origin/main HEAD || true)
-        fi
+          echo "all_changed<<EOF" >> $GITHUB_OUTPUT
+          printf "%s\n" "$changed" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
 
-        # filter for tfvars files inside environments/aws/<env>/requests/<id>.tfvars,
-        # supporting both repo layouts (with or without 'backend/')
-        tfvars_files=$(printf "%s\n" "$changed" | grep -E '(^|/)(environments|backend/terraform/environments)/aws/[^/]+/requests/[^/]+\.tfvars$' || true)
+          if [ -z "$tfvars_files" ]; then
+            echo "no_tfvars=true" >> $GITHUB_OUTPUT
+            echo "tfvars_match=" >> $GITHUB_OUTPUT
+            echo "environment=" >> $GITHUB_OUTPUT
+            echo "request_id=" >> $GITHUB_OUTPUT
+            echo "::warning::No tfvars change detected — skipping deploy."
+            exit 0
+          fi
 
-        echo "ALL_CHANGED_FILES<<EOF" >> $GITHUB_OUTPUT
-        printf "%s\n" "$changed" >> $GITHUB_OUTPUT
-        echo "EOF" >> $GITHUB_OUTPUT
+          # pick first
+          tfvars_file=$(printf "%s\n" "$tfvars_files" | head -n1 | sed 's#^\./##')
 
-        if [ -z "$tfvars_files" ]; then
-          echo "no_tfvars=true" >> $GITHUB_OUTPUT
-          echo "tfvars_match=" >> $GITHUB_OUTPUT
-          echo "environment=" >> $GITHUB_OUTPUT
-          echo "request_id=" >> $GITHUB_OUTPUT
-          echo "::warning::No tfvars change detected in environments/aws/**/requests/*.tfvars — skipping deploy."
-          exit 0
-        fi
-
-        # pick the first matching tfvars (if multiple, extend logic)
-        tfvars_file=$(printf "%s\n" "$tfvars_files" | head -n1 | sed 's#^\./##')
-
-        # normalize to a consistent path variant to parse environment & id
-        # try patterns both with and without backend/terraform prefix
-        if [[ "$tfvars_file" =~ backend/terraform/environments/aws/([^/]+)/requests/([^/]+)\.tfvars$ ]]; then
-          environment=${BASH_REMATCH[1]}
-          request_id=${BASH_REMATCH[2]}
-        elif [[ "$tfvars_file" =~ terraform/environments/aws/([^/]+)/requests/([^/]+)\.tfvars$ ]]; then
-          environment=${BASH_REMATCH[1]}
-          request_id=${BASH_REMATCH[2]}
-        elif [[ "$tfvars_file" =~ environments/aws/([^/]+)/requests/([^/]+)\.tfvars$ ]]; then
-          environment=${BASH_REMATCH[1]}
-          request_id=${BASH_REMATCH[2]}
-        else
-          echo "::error::Could not parse environment/request id from: $tfvars_file"
-          echo "no_tfvars=true" >> $GITHUB_OUTPUT
-          exit 1
-        fi
-
-        echo "no_tfvars=false" >> $GITHUB_OUTPUT
-        echo "tfvars_match=$tfvars_file" >> $GITHUB_OUTPUT
-        echo "environment=$environment" >> $GITHUB_OUTPUT
-        echo "request_id=$request_id" >> $GITHUB_OUTPUT
-
-    - name: Deploy (terraform plan & apply)
-      if: steps.detect.outputs.no_tfvars == 'false' && steps.detect.outputs.request_id != ''
-      env:
-        API_URL: ${{ secrets.API_URL }}
-        API_TOKEN: ${{ secrets.API_TOKEN }}
-      run: |
-        set -euo pipefail
-
-        environment="${{ steps.detect.outputs.environment }}"
-        request_id="${{ steps.detect.outputs.request_id }}"
-        tfvars="${{ steps.detect.outputs.tfvars_match }}"
-
-        echo "=== Deployment Phase ==="
-        echo "Request: $request_id"
-        echo "Environment: $environment"
-        echo "Using tfvars: $tfvars"
-
-        # determine base dir (support both 'terraform/...' and 'backend/terraform/...')
-        if [[ "$tfvars" == backend/terraform/* ]]; then
-          base="backend/terraform/environments/aws/$environment"
-          tfvars_rel="${tfvars#backend/}"
-        else
-          base="terraform/environments/aws/$environment"
-          tfvars_rel="$tfvars"
-        fi
-
-        # sanity check
-        if [ ! -d "$base" ]; then
-          echo "::error::Terraform environment directory not found: $base"
-          ls -la "$(dirname "$tfvars")" || true
-          exit 1
-        fi
-
-        cd "$base"
-
-        # Ensure tfvars file exists relative to this dir
-        if [ ! -f "requests/${request_id}.tfvars" ]; then
-          echo "::error::tfvars file not found at requests/${request_id}.tfvars relative to $base"
-          echo "Absolute path candidate: $(pwd)/requests/${request_id}.tfvars"
-          exit 1
-        fi
-
-        echo "Initializing Terraform..."
-        terraform init -input=false
-
-        echo "Planning..."
-        # -detailed-exitcode: 0 = no changes, 2 = changes, 1 = error
-        rc=0
-        terraform plan -var-file="requests/${request_id}.tfvars" -out=tfplan -detailed-exitcode || rc=$?; true
-        rc=${rc:-0}
-        if [ "$rc" -eq 1 ]; then
-          echo "::error::terraform plan failed (exit code 1)"
-          terraform plan -var-file="requests/${request_id}.tfvars" || true
-          exit 1
-        fi
-
-        if [ "$rc" -eq 0 ]; then
-          echo "No changes to apply (terraform plan exit code 0). Exiting."
-          exit 0
-        fi
-
-        # rc == 2 => there are changes to apply
-        echo "Applying changes..."
-        terraform apply -auto-approve tfplan
-
-        echo "✅ Terraform apply finished for $request_id"
-
-        # -------------------------
-        # Capture outputs and state
-        # -------------------------
-        echo "Collecting terraform outputs..."
-        terraform output -json > /tmp/terraform_outputs.json || echo "{}" > /tmp/terraform_outputs.json
-        echo "Pulling terraform state..."
-        terraform state pull > /tmp/terraform_state.tfstate || echo "{}" > /tmp/terraform_state.tfstate
-        if [ -f tfplan ]; then
-          terraform show -json tfplan > /tmp/terraform_plan.json || true
-        fi
-
-        # Build notification payload using jq (runner usually has jq)
-        echo "Building notification payload..."
-        payload=$(jq -n \
-          --arg rid "$request_id" \
-          --arg env "$environment" \
-          --arg tfvars_path "$tfvars_rel" \
-          --argjson outputs "$(cat /tmp/terraform_outputs.json)" \
-          '{request_id: $rid, environment: $env, tfvars: $tfvars_path, outputs: $outputs}')
-
-        # POST JSON notification
-        if [ -n "${API_URL-}" ]; then
-          echo "Posting notification to backend: $API_URL/infrastructure/notify-deployment"
-          curl -sS -X POST "${API_URL%/}/infrastructure/notify-deployment" \
-            -H "Content-Type: application/json" \
-            -H "Authorization: Bearer ${API_TOKEN-}" \
-            -d "$payload" \
-            -o /tmp/notify_resp.json || echo "notify failed"
-
-          echo "Notification response:"
-          cat /tmp/notify_resp.json || true
-
-          # Upload tfvars + state as multipart
-          echo "Uploading tfvars and state to backend..."
-          # if tfvars path contains backend/ prefix, we need correct absolute path; use $GITHUB_WORKSPACE
-          # Determine absolute tfvars path:
-          if [[ "$tfvars" == backend/* ]]; then
-            abs_tfvars_path="${GITHUB_WORKSPACE}/${tfvars}"
+          # extract environment & request id from either possible path
+          if [[ "$tfvars_file" =~ environments/aws/([^/]+)/requests/([^/]+)\.tfvars$ ]]; then
+            environment=${BASH_REMATCH[1]}
+            request_id=${BASH_REMATCH[2]}
+          elif [[ "$tfvars_file" =~ backend/terraform/environments/aws/([^/]+)/requests/([^/]+)\.tfvars$ ]]; then
+            environment=${BASH_REMATCH[1]}
+            request_id=${BASH_REMATCH[2]}
           else
-            abs_tfvars_path="${GITHUB_WORKSPACE}/${tfvars}"
+            echo "::error::Could not parse environment/request id from: $tfvars_file"
+            echo "no_tfvars=true" >> $GITHUB_OUTPUT
+            exit 1
           fi
 
-          # ensure files exist
-          echo "abs_tfvars_path=$abs_tfvars_path"
-          if [ ! -f "$abs_tfvars_path" ]; then
-            echo "::warning::Cannot find tfvars at $abs_tfvars_path to upload (maybe removed after checkout?)"
+          echo "no_tfvars=false" >> $GITHUB_OUTPUT
+          echo "tfvars_match=$tfvars_file" >> $GITHUB_OUTPUT
+          echo "environment=$environment" >> $GITHUB_OUTPUT
+          echo "request_id=$request_id" >> $GITHUB_OUTPUT
+
+      - name: Deploy (plan & apply)
+        if: steps.detect.outputs.no_tfvars == 'false' && steps.detect.outputs.request_id != ''
+        run: |
+          set -euo pipefail
+          environment="${{ steps.detect.outputs.environment }}"
+          request_id="${{ steps.detect.outputs.request_id }}"
+          tfvars="${{ steps.detect.outputs.tfvars_match }}"
+
+          echo "Request: $request_id"
+          echo "Environment: $environment"
+          echo "Using tfvars: $tfvars"
+
+          # choose base depending on which layout the tfvars path uses
+          if [[ "$tfvars" == backend/terraform/* ]]; then
+            base="backend/terraform/environments/aws/$environment"
+            tfvars_rel="requests/${request_id}.tfvars"
+          else
+            base="terraform/environments/aws/$environment"
+            tfvars_rel="requests/${request_id}.tfvars"
           fi
 
-          curl -sS -X POST "${API_URL%/}/infrastructure/upload-terraform" \
-            -H "Authorization: Bearer ${API_TOKEN-}" \
-            -F "request_id=$request_id" \
-            -F "environment=$environment" \
-            -F "tfvars_file=@${abs_tfvars_path}" \
-            -F "state_file=@/tmp/terraform_state.tfstate" \
-            -o /tmp/upload_resp.json || echo "upload failed"
+          if [ ! -d "$base" ]; then
+            echo "::error::Terraform environment directory not found: $base"
+            ls -la "$(dirname "$tfvars")" || true
+            exit 1
+          fi
 
-          echo "Upload response:"
-          cat /tmp/upload_resp.json || true
-        else
-          echo "::warning::API_URL not set; skipping notification/upload"
-        fi
+          cd "$base"
 
-    - name: Finish
-      run: echo "Done"
+          if [ ! -f "$tfvars_rel" ]; then
+            echo "::error::tfvars file not found at $tfvars_rel relative to $base"
+            echo "Abs candidate: $(pwd)/$tfvars_rel"
+            exit 1
+          fi
+
+          echo "Initializing Terraform..."
+          terraform init -input=false
+
+          echo "Planning..."
+          # detailed-exitcode: 0=no changes, 2=changes, 1=error
+          set +e
+          terraform plan -var-file="$tfvars_rel" -out=tfplan -detailed-exitcode
+          rc=$?
+          set -e
+          if [ "$rc" -eq 1 ]; then
+            echo "::error::terraform plan failed (exit code 1)"
+            terraform plan -var-file="$tfvars_rel" || true
+            exit 1
+          fi
+
+          if [ "$rc" -eq 0 ]; then
+            echo "No changes to apply (terraform plan exit code 0). Exiting."
+            exit 0
+          fi
+
+          # rc == 2 -> changes present
+          echo "Applying changes..."
+          terraform apply -auto-approve tfplan
+
+      - name: Collect outputs & state (on success)
+        if: success() && steps.detect.outputs.no_tfvars == 'false' && steps.detect.outputs.request_id != ''
+        id: collect
+        run: |
+          set -euo pipefail
+          environment="${{ steps.detect.outputs.environment }}"
+          request_id="${{ steps.detect.outputs.request_id }}"
+          tfvars="${{ steps.detect.outputs.tfvars_match }}"
+
+          # determine base dir again
+          if [[ "$tfvars" == backend/terraform/* ]]; then
+            base="backend/terraform/environments/aws/$environment"
+            tfvars_rel="requests/${request_id}.tfvars"
+            tfvars_abs="$(pwd)/../.."/"$tfvars" || true
+          else
+            base="terraform/environments/aws/$environment"
+            tfvars_rel="requests/${request_id}.tfvars"
+          fi
+
+          cd "$base"
+
+          # outputs as JSON
+          terraform output -json > outputs.json || echo "{}" > outputs.json
+
+          # pull state
+          terraform state pull > state.tfstate || echo "{}" > state.tfstate
+
+          # record paths (these relative-to-repo values used when posting)
+          echo "outputs_file=$(pwd)/outputs.json" >> $GITHUB_OUTPUT
+          echo "state_file=$(pwd)/state.tfstate" >> $GITHUB_OUTPUT
+          # we also expose the tfvars path used (relative to repo root)
+          # find absolute tfvars path by looking at repo structure
+          repo_root=$(git rev-parse --show-toplevel)
+          # try both possible tfvars absolute candidates
+          if [ -f "$repo_root/$tfvars" ]; then
+            echo "tfvars_repo_path=$tfvars" >> $GITHUB_OUTPUT
+            echo "tfvars_abs=$repo_root/$tfvars" >> $GITHUB_OUTPUT
+          elif [ -f "$repo_root/$base/$tfvars_rel" ]; then
+            # when tfvars file is inside the chosen base
+            relpath="$base/$tfvars_rel"
+            echo "tfvars_repo_path=$relpath" >> $GITHUB_OUTPUT
+            echo "tfvars_abs=$repo_root/$relpath" >> $GITHUB_OUTPUT
+          else
+            echo "tfvars_repo_path=$tfvars" >> $GITHUB_OUTPUT
+            echo "tfvars_abs=" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Notify backend (deployment success)
+        if: success() && steps.detect.outputs.no_tfvars == 'false' && steps.detect.outputs.request_id != ''
+        continue-on-error: true
+        env:
+          API_URL: ${{ env.API_URL }}
+          API_TOKEN: ${{ env.API_TOKEN }}
+        run: |
+          set -euo pipefail
+          request_id="${{ steps.detect.outputs.request_id }}"
+          environment="${{ steps.detect.outputs.environment }}"
+          outputs_file="${{ steps.collect.outputs.outputs_file }}"
+          state_file="${{ steps.collect.outputs.state_file }}"
+          tfvars_repo_path="${{ steps.collect.outputs.tfvars_repo_path }}"
+
+          api_url="${API_URL%/}"   # strip trailing slash if any
+          notify_endpoint="$api_url/infrastructure/notify-deployment"
+
+          # read outputs (JSON)
+          outputs_json=$(cat "$outputs_file" || echo "{}")
+
+          # build payload
+          read -r -d '' payload <<EOF || true
+{
+  "request_id": "${request_id}",
+  "environment": "${environment}",
+  "tfvars": "${tfvars_repo_path}",
+  "outputs": ${outputs_json}
+}
+EOF
+
+          echo "Posting deployment notification to $notify_endpoint"
+          headers=(-H "Content-Type: application/json")
+          if [ -n "$API_TOKEN" ]; then
+            headers+=(-H "Authorization: Bearer $API_TOKEN")
+          fi
+
+          # send notification (do not fail whole job if backend refuses)
+          curl --fail -sS "${headers[@]}" -X POST "$notify_endpoint" -d "$payload" || {
+            echo "Warning: notify-deployment request failed"
+            exit 0
+          }
+
+      - name: Upload tfvars + state to backend (archive)
+        if: success() && steps.detect.outputs.no_tfvars == 'false' && steps.detect.outputs.request_id != ''
+        continue-on-error: true
+        env:
+          API_URL: ${{ env.API_URL }}
+          API_TOKEN: ${{ env.API_TOKEN }}
+        run: |
+          set -euo pipefail
+          api_url="${API_URL%/}"
+          upload_endpoint="$api_url/infrastructure/upload-terraform"
+          request_id="${{ steps.detect.outputs.request_id }}"
+          environment="${{ steps.detect.outputs.environment }}"
+
+          outputs_file="${{ steps.collect.outputs.outputs_file }}"
+          state_file="${{ steps.collect.outputs.state_file }}"
+          tfvars_abs="${{ steps.collect.outputs.tfvars_abs }}"
+
+          # Ensure files exist (they should)
+          [ -f "$state_file" ] || echo "{}" > "$state_file"
+          [ -f "$outputs_file" ] || echo "{}" > "$outputs_file"
+
+          # If tfvars_abs is empty or not present, attempt locate in repo
+          if [ -z "$tfvars_abs" ] || [ ! -f "$tfvars_abs" ]; then
+            # try repo-relative common paths
+            repo_root=$(git rev-parse --show-toplevel)
+            cand="$repo_root/terraform/environments/aws/$environment/requests/$request_id.tfvars"
+            if [ -f "$cand" ]; then
+              tfvars_abs="$cand"
+            else
+              cand2="$repo_root/backend/terraform/environments/aws/$environment/requests/$request_id.tfvars"
+              if [ -f "$cand2" ]; then
+                tfvars_abs="$cand2"
+              fi
+            fi
+          fi
+
+          # fallback create small body if tfvars not found
+          if [ -f "$tfvars_abs" ]; then
+            echo "Uploading tfvars and state to $upload_endpoint"
+            headers=(-H "Accept: application/json")
+            if [ -n "$API_TOKEN" ]; then
+              headers+=(-H "Authorization: Bearer $API_TOKEN")
+            fi
+
+            curl --fail -sS "${headers[@]}" \
+              -F "request_id=${request_id}" \
+              -F "environment=${environment}" \
+              -F "tfvars_file=@${tfvars_abs}" \
+              -F "state_file=@${state_file}" \
+              -F "outputs_file=@${outputs_file}" \
+              "$upload_endpoint" || {
+                echo "Warning: upload-terraform request failed"
+                exit 0
+              }
+          else
+            echo "Warning: tfvars file not found for upload; sending state and outputs only"
+            headers=(-H "Accept: application/json")
+            if [ -n "$API_TOKEN" ]; then
+              headers+=(-H "Authorization: Bearer $API_TOKEN")
+            fi
+            curl --fail -sS "${headers[@]}" \
+              -F "request_id=${request_id}" \
+              -F "environment=${environment}" \
+              -F "state_file=@${state_file}" \
+              -F "outputs_file=@${outputs_file}" \
+              "$upload_endpoint" || {
+                echo "Warning: upload-terraform request failed"
+                exit 0
+              }
+          fi
+
+      - name: Notify backend (failure)
+        if: failure() && steps.detect.outputs.no_tfvars == 'false' && steps.detect.outputs.request_id != ''
+        continue-on-error: true
+        env:
+          API_URL: ${{ env.API_URL }}
+          API_TOKEN: ${{ env.API_TOKEN }}
+        run: |
+          set -euo pipefail
+          request_id="${{ steps.detect.outputs.request_id }}"
+          environment="${{ steps.detect.outputs.environment }}"
+          api_url="${API_URL%/}"
+          notify_endpoint="$api_url/infrastructure/notify-deployment-failed"
+
+          # capture last 200 lines of logs as message
+          log_excerpt=$(tail -n 200 "$GITHUB_WORKSPACE/.github/workflows/deploy-infrastructure.yml" 2>/dev/null || true)
+
+          body=$( jq -n --arg r "$request_id" --arg e "$environment" --arg m "$log_excerpt" '{request_id:$r, environment:$e, message:$m}' )
+          headers=(-H "Content-Type: application/json")
+          if [ -n "$API_TOKEN" ]; then
+            headers+=(-H "Authorization: Bearer $API_TOKEN")
+          fi
+
+          curl --fail -sS "${headers[@]}" -X POST "$notify_endpoint" -d "$body" || {
+            echo "Warning: notify-deployment-failed request failed"
+            exit 0
+          }
+
+      - name: Finish
+        run: echo "Done"
+
 
 
