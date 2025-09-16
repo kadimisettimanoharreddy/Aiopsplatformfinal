@@ -15,7 +15,7 @@ jobs:
     - name: Checkout
       uses: actions/checkout@v4
       with:
-        fetch-depth: 0
+        fetch-depth: 0   # fetch full history to ensure HEAD~1 exists
 
     - name: Setup Terraform
       uses: hashicorp/setup-terraform@v2
@@ -35,9 +35,16 @@ jobs:
       run: |
         set -euo pipefail
 
-        # Try to compute changed .tfvars between last commit and HEAD; fallback to origin/main
+        echo "=== repo debug ==="
+        git rev-parse --verify HEAD || true
+        git rev-parse --verify HEAD~1 2>/dev/null || echo "HEAD~1 missing (will fallback)"
+        git --no-pager log --oneline -n 5 || true
+
+        # Try HEAD~1..HEAD first, fallback to origin/main..HEAD
         changed_files=$(git diff --name-only HEAD~1 HEAD | grep -E '\.tfvars$' || true)
         if [ -z "$changed_files" ]; then
+          echo "No changed tfvars from HEAD~1..HEAD; trying origin/main..HEAD"
+          git fetch origin main --depth=1 || true
           changed_files=$(git diff --name-only origin/main HEAD | grep -E '\.tfvars$' || true)
         fi
 
@@ -50,15 +57,19 @@ jobs:
 
         if [ -n "$changed_files" ]; then
           for file in $changed_files; do
+            # expecting terraform/environments/aws/<env>/requests/<id>.tfvars
             if [[ $file =~ ^terraform/environments/aws/([^/]+)/requests/([^/]+)\.tfvars$ ]]; then
               environment="${BASH_REMATCH[1]}"
               request_id="${BASH_REMATCH[2]}"
+              echo "Found request: env=$environment id=$request_id file=$file"
               echo "environment=$environment" >> $GITHUB_OUTPUT
               echo "request_id=$request_id" >> $GITHUB_OUTPUT
               echo "tfvars_file=$file" >> $GITHUB_OUTPUT
               break
             fi
           done
+        else
+          echo "No matching tfvars changed; nothing to deploy."
         fi
 
     - name: Deploy Infrastructure
@@ -68,13 +79,16 @@ jobs:
 
         environment=${{ steps.extract-info.outputs.environment }}
         request_id=${{ steps.extract-info.outputs.request_id }}
+        tfvars_file=${{ steps.extract-info.outputs.tfvars_file }}
 
-        echo "Deploying request $request_id to environment $environment"
+        echo "Deploying request_id=$request_id in environment=$environment (tfvars: $tfvars_file)"
 
         cd terraform/environments/aws/"$environment"
 
         terraform init -input=false
         terraform plan -var-file="requests/${request_id}.tfvars" -out=tfplan
         terraform apply -auto-approve tfplan
+
+        echo "Terraform apply finished for request $request_id"
 
 
