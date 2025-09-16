@@ -10,10 +10,12 @@ jobs:
   deploy:
     if: github.event.pull_request.merged == true
     runs-on: ubuntu-latest
-    
+
     steps:
     - name: Checkout
       uses: actions/checkout@v4
+      with:
+        fetch-depth: 2
 
     - name: Setup Terraform
       uses: hashicorp/setup-terraform@v2
@@ -31,15 +33,47 @@ jobs:
     - name: Extract request info
       id: extract-info
       run: |
+        set -euo pipefail
+
+        # Ensure we can reference HEAD~1; fetch minimal history if needed
+        if ! git rev-parse --verify HEAD~1 >/dev/null 2>&1; then
+          echo "No HEAD~1 locally — fetching minimal history"
+          # try minimal depth first; if that fails, fetch full branch
+          git fetch --no-tags --prune --depth=2 origin "$GITHUB_REF" || git fetch --no-tags --prune origin "$GITHUB_REF"
+        fi
+
+        # Try diff between HEAD~1 and HEAD
         changed_files=$(git diff --name-only HEAD~1 HEAD | grep -E '\.tfvars$' || true)
-        
+
+        # Fallback: compare with origin/main if still empty (useful for merges where history differs)
+        if [ -z "$changed_files" ]; then
+          changed_files=$(git diff --name-only origin/main HEAD | grep -E '\.tfvars$' || true)
+        fi
+
+        echo "Detected changed tfvars files:"
+        echo "$changed_files"
+
+        # default outputs (empty)
+        echo "environment=" >> $GITHUB_OUTPUT
+        echo "request_id=" >> $GITHUB_OUTPUT
+        echo "user_email=" >> $GITHUB_OUTPUT
+        echo "tfvars_file=" >> $GITHUB_OUTPUT
+
         if [ -n "$changed_files" ]; then
           for file in $changed_files; do
-            if [[ $file =~ terraform/environments/aws/([^/]+)/requests/([^/]+)\.tfvars ]]; then
+            # match expected path terraform/environments/aws/<env>/requests/<id>.tfvars
+            if [[ $file =~ ^terraform/environments/aws/([^/]+)/requests/([^/]+)\.tfvars$ ]]; then
               environment="${BASH_REMATCH[1]}"
               request_id="${BASH_REMATCH[2]}"
-              user_email=$(grep -oP 'created_by = "\K[^"]+' $file)
-              
+
+              # pull created_by from tfvars (robust: try multiple patterns)
+              user_email=$(grep -oP 'created_by\s*=\s*"\K[^"]+' "$file" || true)
+              if [ -z "$user_email" ]; then
+                user_email=$(grep -oP 'created_by_email\s*=\s*"\K[^"]+' "$file" || true)
+              fi
+
+              echo "Found request: env=$environment id=$request_id file=$file user_email=$user_email"
+
               echo "environment=$environment" >> $GITHUB_OUTPUT
               echo "request_id=$request_id" >> $GITHUB_OUTPUT
               echo "user_email=$user_email" >> $GITHUB_OUTPUT
@@ -47,40 +81,59 @@ jobs:
               break
             fi
           done
+        else
+          echo "No matching tfvars changed; leaving outputs empty."
         fi
 
     - name: Deploy Infrastructure
-      if: steps.extract-info.outputs.request_id
+      if: steps.extract-info.outputs.request_id != ''
       run: |
+        set -euo pipefail
+
         environment=${{ steps.extract-info.outputs.environment }}
         request_id=${{ steps.extract-info.outputs.request_id }}
-        
-        cd terraform/environments/aws/$environment
-        
-        terraform init
+
+        echo "Deploying request $request_id to environment $environment"
+
+        cd terraform/environments/aws/"$environment"
+
+        terraform init -input=false
         terraform plan -var-file="requests/${request_id}.tfvars" -out=tfplan
         terraform apply -auto-approve tfplan
-        
+
+        # capture outputs (use fallback empty values)
         instance_id=$(terraform output -raw instance_id 2>/dev/null || echo "")
         public_ip=$(terraform output -raw public_ip 2>/dev/null || echo "")
         console_url=$(terraform output -raw console_url 2>/dev/null || echo "")
         ssh_command=$(terraform output -raw ssh_command 2>/dev/null || echo "")
         terraform_state=$(terraform show -json 2>/dev/null || echo "{}")
-        
+
         echo "instance_id=$instance_id" >> $GITHUB_ENV
         echo "public_ip=$public_ip" >> $GITHUB_ENV
         echo "console_url=$console_url" >> $GITHUB_ENV
         echo "ssh_command=$ssh_command" >> $GITHUB_ENV
+
+        # Write terraform_state safely (multi-line)
         echo "terraform_state<<EOF" >> $GITHUB_ENV
         echo "$terraform_state" >> $GITHUB_ENV
         echo "EOF" >> $GITHUB_ENV
 
     - name: Store State
-      if: steps.extract-info.outputs.request_id && env.instance_id
+      if: steps.extract-info.outputs.request_id != '' && env.instance_id != ''
       run: |
+        set -euo pipefail
+
         request_id=${{ steps.extract-info.outputs.request_id }}
-        
-        curl -X POST "${{ secrets.API_URL }}/infrastructure/store-state" \
+
+        # ensure terraform_state is safe JSON string for curl body
+        if [ -z "$terraform_state" ] || [ "$terraform_state" = "{}" ]; then
+          terraform_state_json="{}"
+        else
+          # terraform_state is JSON already; escape for one-line embedding
+          terraform_state_json=$(printf '%s' "$terraform_state" | jq -c . || printf '%s' "{}")
+        fi
+
+        curl -sS -X POST "${{ secrets.API_URL }}/infrastructure/store-state" \
           -H "Authorization: Bearer ${{ secrets.API_TOKEN }}" \
           -H "Content-Type: application/json" \
           -d "{
@@ -89,19 +142,21 @@ jobs:
             \"public_ip\": \"$public_ip\",
             \"console_url\": \"$console_url\",
             \"ssh_command\": \"$ssh_command\",
-            \"terraform_state\": $(echo \"$terraform_state\" | jq -R -s .),
+            \"terraform_state\": $terraform_state_json,
             \"cloud_provider\": \"aws\",
             \"environment\": \"${{ steps.extract-info.outputs.environment }}\",
             \"status\": \"deployed\"
           }"
 
     - name: Notify Success
-      if: steps.extract-info.outputs.request_id && env.instance_id
+      if: steps.extract-info.outputs.request_id != '' && env.instance_id != ''
       run: |
+        set -euo pipefail
+
         request_id=${{ steps.extract-info.outputs.request_id }}
         user_email=${{ steps.extract-info.outputs.user_email }}
-        
-        curl -X POST "${{ secrets.API_URL }}/infrastructure/notify-deployment" \
+
+        curl -sS -X POST "${{ secrets.API_URL }}/infrastructure/notify-deployment" \
           -H "Authorization: Bearer ${{ secrets.API_TOKEN }}" \
           -H "Content-Type: application/json" \
           -d "{
@@ -115,12 +170,14 @@ jobs:
           }"
 
     - name: Notify Failure
-      if: failure() && steps.extract-info.outputs.request_id
+      if: failure() && steps.extract-info.outputs.request_id != ''
       run: |
+        set -euo pipefail
+
         request_id=${{ steps.extract-info.outputs.request_id }}
         user_email=${{ steps.extract-info.outputs.user_email }}
-        
-        curl -X POST "${{ secrets.API_URL }}/infrastructure/notify-deployment" \
+
+        curl -sS -X POST "${{ secrets.API_URL }}/infrastructure/notify-deployment" \
           -H "Authorization: Bearer ${{ secrets.API_TOKEN }}" \
           -H "Content-Type: application/json" \
           -d "{
@@ -129,3 +186,4 @@ jobs:
             \"status\": \"failed\",
             \"error_message\": \"Terraform deployment failed\"
           }"
+
