@@ -1,216 +1,160 @@
 name: Deploy Infrastructure
+
 on:
   pull_request:
     types: [closed]
     branches: [main]
-    paths: ['backend/terraform/environments/**']
+    paths:
+      - 'terraform/environments/**'
+      - 'backend/terraform/environments/**'
 
 jobs:
   deploy:
+    # only run when the PR was merged
     if: github.event.pull_request.merged == true
     runs-on: ubuntu-latest
     steps:
-    - name: Checkout
+
+    - name: Checkout (full history)
       uses: actions/checkout@v4
       with:
-        fetch-depth: 0   # fetch full history to ensure HEAD~1 exists
+        fetch-depth: 0
 
-    - name: Setup Terraform
+    - name: Setup Terraform CLI
       uses: hashicorp/setup-terraform@v2
       with:
         terraform_version: 1.5.0
         terraform_wrapper: false
 
-    - name: Configure AWS
+    - name: Configure AWS credentials
       uses: aws-actions/configure-aws-credentials@v2
       with:
         aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         aws-region: us-east-1
 
-    - name: Extract request info
-      id: extract-info
+    - name: Detect changed tfvars
+      id: detect
       run: |
         set -euo pipefail
-        
-        echo "=== Repository Debug ==="
-        echo "Current HEAD: $(git rev-parse HEAD)"
-        echo "Repository: ${{ github.repository }}"
-        echo "PR Number: ${{ github.event.pull_request.number }}"
-        echo "Base SHA: ${{ github.event.pull_request.base.sha }}"
-        echo "Head SHA: ${{ github.event.pull_request.head.sha }}"
-        
-        # Verify commits exist
-        git rev-parse --verify HEAD || echo "ERROR: HEAD not found"
-        git rev-parse --verify HEAD~1 2>/dev/null || echo "WARNING: HEAD~1 missing"
-        
-        echo "=== Recent Commits ==="
-        git --no-pager log --oneline -n 5 || true
-        
-        echo "=== Finding Changed Files ==="
-        # Try multiple strategies to find changed files
-        changed_files=""
-        
-        # Strategy 1: HEAD~1..HEAD
-        if git rev-parse --verify HEAD~1 >/dev/null 2>&1; then
-          echo "Trying HEAD~1..HEAD"
-          changed_files=$(git diff --name-only HEAD~1 HEAD | grep -E '\.tfvars$' || true)
-          echo "Files from HEAD~1..HEAD: $changed_files"
+        echo "Detecting changed .tfvars files... (trying HEAD~1..HEAD, falling back to origin/main..HEAD)"
+
+        # Try diff between HEAD~1 and HEAD
+        changed=$(git diff --name-only HEAD~1 HEAD || true)
+
+        if [ -z "$changed" ]; then
+          echo "No local HEAD~1; fetching origin/main to compare..."
+          git fetch origin main --depth=1 || git fetch origin main
+          changed=$(git diff --name-only origin/main HEAD || true)
         fi
-        
-        # Strategy 2: origin/main..HEAD if first strategy failed
-        if [ -z "$changed_files" ]; then
-          echo "Trying origin/main..HEAD"
-          git fetch origin main --depth=50 || true
-          changed_files=$(git diff --name-only origin/main HEAD | grep -E '\.tfvars$' || true)
-          echo "Files from origin/main..HEAD: $changed_files"
+
+        # include both possible repo layouts:
+        # terraform/environments/aws/<env>/requests/<id>.tfvars
+        # backend/terraform/environments/aws/<env>/requests/<id>.tfvars
+        tfvars_files=$(printf "%s\n" "$changed" | grep -E '(^|/)environments/aws/[^/]+/requests/[^/]+\.tfvars$' || true)
+
+        echo "ALL_CHANGED_FILES<<EOF" >> $GITHUB_OUTPUT
+        printf "%s\n" "$changed" >> $GITHUB_OUTPUT
+        echo "EOF" >> $GITHUB_OUTPUT
+
+        if [ -z "$tfvars_files" ]; then
+          echo "no_tfvars=true" >> $GITHUB_OUTPUT
+          echo "tfvars_match=" >> $GITHUB_OUTPUT
+          echo "environment=" >> $GITHUB_OUTPUT
+          echo "request_id=" >> $GITHUB_OUTPUT
+          echo "::warning::No tfvars change detected in environments/aws/**/requests/*.tfvars — skipping deploy."
+          exit 0
         fi
-        
-        # Strategy 3: Use GitHub API data if available
-        if [ -z "$changed_files" ]; then
-          echo "Trying to list all .tfvars files in backend/terraform/environments/"
-          find backend/terraform/environments/ -name "*.tfvars" -type f 2>/dev/null || echo "No backend/terraform/environments directory found"
-        fi
-        
-        echo "=== All found .tfvars files ==="
-        echo "Changed .tfvars files: $changed_files"
-        
-        # Initialize outputs with empty values
-        echo "environment=" >> $GITHUB_OUTPUT
-        echo "request_id=" >> $GITHUB_OUTPUT
-        echo "tfvars_file=" >> $GITHUB_OUTPUT
-        
-        if [ -n "$changed_files" ]; then
-          for file in $changed_files; do
-            echo "Processing file: $file"
-            
-            # Expected pattern: backend/terraform/environments/aws/<env>/requests/<id>.tfvars
-            if [[ $file =~ ^backend/terraform/environments/aws/([^/]+)/requests/([^/]+)\.tfvars$ ]]; then
-              environment="${BASH_REMATCH[1]}"
-              request_id="${BASH_REMATCH[2]}"
-              echo "✅ MATCH FOUND: env=$environment id=$request_id file=$file"
-              echo "environment=$environment" >> $GITHUB_OUTPUT
-              echo "request_id=$request_id" >> $GITHUB_OUTPUT
-              echo "tfvars_file=$file" >> $GITHUB_OUTPUT
-              break
-            else
-              echo "❌ Pattern mismatch for file: $file"
-              echo "Expected pattern: backend/terraform/environments/aws/<env>/requests/<id>.tfvars"
-            fi
-          done
+
+        # pick the first matching tfvars (if multiple, you can extend logic)
+        # normalize path to remove leading './' if present
+        tfvars_file=$(printf "%s\n" "$tfvars_files" | head -n1 | sed 's#^\./##')
+        # extract environment and request id
+        if [[ "$tfvars_file" =~ environments/aws/([^/]+)/requests/([^/]+)\.tfvars$ ]]; then
+          environment=${BASH_REMATCH[1]}
+          request_id=${BASH_REMATCH[2]}
         else
-          echo "⚠️  No .tfvars files found in changes"
+          # try backend/terraform prefix variant
+          if [[ "$tfvars_file" =~ backend/terraform/environments/aws/([^/]+)/requests/([^/]+)\.tfvars$ ]]; then
+            environment=${BASH_REMATCH[1]}
+            request_id=${BASH_REMATCH[2]}
+          else
+            echo "::error::Could not parse environment/request id from: $tfvars_file"
+            echo "no_tfvars=true" >> $GITHUB_OUTPUT
+            exit 1
+          fi
         fi
-        
-        echo "=== Final Outputs ==="
-        echo "Environment: $(cat $GITHUB_OUTPUT | grep '^environment=' | cut -d'=' -f2-)"
-        echo "Request ID: $(cat $GITHUB_OUTPUT | grep '^request_id=' | cut -d'=' -f2-)"
-        echo "TFVars File: $(cat $GITHUB_OUTPUT | grep '^tfvars_file=' | cut -d'=' -f2-)"
 
-    - name: Validate Terraform Configuration
-      if: steps.extract-info.outputs.request_id != ''
+        echo "no_tfvars=false" >> $GITHUB_OUTPUT
+        echo "tfvars_match=$tfvars_file" >> $GITHUB_OUTPUT
+        echo "environment=$environment" >> $GITHUB_OUTPUT
+        echo "request_id=$request_id" >> $GITHUB_OUTPUT
+
+    - name: Deploy (terraform plan & apply)
+      if: steps.detect.outputs.no_tfvars == 'false' && steps.detect.outputs.request_id != ''
+      env:
+        TF_VAR_file: ${{ steps.detect.outputs.tfvars_match }}
       run: |
         set -euo pipefail
-        environment=${{ steps.extract-info.outputs.environment }}
-        request_id=${{ steps.extract-info.outputs.request_id }}
-        tfvars_file=${{ steps.extract-info.outputs.tfvars_file }}
-        
-        echo "=== Validation Phase ==="
-        echo "Environment: $environment"
-        echo "Request ID: $request_id"  
-        echo "TFVars File: $tfvars_file"
-        
-        # Verify files exist
-        if [ ! -f "$tfvars_file" ]; then
-          echo "ERROR: TFVars file not found: $tfvars_file"
-          exit 1
-        fi
-        
-        terraform_dir="backend/terraform/environments/aws/$environment"
-        if [ ! -d "$terraform_dir" ]; then
-          echo "ERROR: Terraform directory not found: $terraform_dir"
-          exit 1
-        fi
-        
-        echo "✅ All required files and directories exist"
 
-    - name: Deploy Infrastructure
-      if: steps.extract-info.outputs.request_id != ''
-      run: |
-        set -euo pipefail
-        environment=${{ steps.extract-info.outputs.environment }}
-        request_id=${{ steps.extract-info.outputs.request_id }}
-        tfvars_file=${{ steps.extract-info.outputs.tfvars_file }}
-        
+        environment="${{ steps.detect.outputs.environment }}"
+        request_id="${{ steps.detect.outputs.request_id }}"
+        tfvars="${{ steps.detect.outputs.tfvars_match }}"
+
         echo "=== Deployment Phase ==="
-        echo "Deploying request_id=$request_id in environment=$environment"
-        echo "Using tfvars file: $tfvars_file"
-        
-        cd backend/terraform/environments/aws/"$environment"
-        
-        # Initialize Terraform
+        echo "Request: $request_id"
+        echo "Environment: $environment"
+        echo "Using tfvars: $tfvars"
+
+        # determine base dir (support both 'terraform/...' and 'backend/terraform/...')
+        # prefer path that contains the tfvars file
+        if [[ "$tfvars" == backend/terraform/* ]]; then
+          base="backend/terraform/environments/aws/$environment"
+        else
+          base="terraform/environments/aws/$environment"
+        fi
+
+        if [ ! -d "$base" ]; then
+          echo "::error::Terraform environment directory not found: $base"
+          ls -la "$(dirname "$tfvars")" || true
+          exit 1
+        fi
+
+        cd "$base"
+
+        # Ensure tfvars file exists relative to this dir (it should)
+        if [ ! -f "requests/${request_id}.tfvars" ]; then
+          echo "::error::tfvars file not found at requests/${request_id}.tfvars relative to $base"
+          echo "Absolute path candidate: $(pwd)/requests/${request_id}.tfvars"
+          exit 1
+        fi
+
         echo "Initializing Terraform..."
         terraform init -input=false
-        
-        # Plan deployment
-        echo "Planning deployment..."
-        terraform plan -var-file="requests/${request_id}.tfvars" -out=tfplan -detailed-exitcode
-        
-        # Apply deployment
-        echo "Applying deployment..."
+
+        echo "Planning..."
+        # -detailed-exitcode: 0 = no changes, 2 = changes, 1 = error
+        terraform plan -var-file="requests/${request_id}.tfvars" -out=tfplan -detailed-exitcode || rc=$?; true
+        rc=${rc:-0}
+        if [ "$rc" -eq 1 ]; then
+          echo "::error::terraform plan failed (exit code 1)"
+          terraform plan -var-file="requests/${request_id}.tfvars" || true
+          exit 1
+        fi
+
+        if [ "$rc" -eq 0 ]; then
+          echo "No changes to apply (terraform plan exit code 0). Exiting."
+          exit 0
+        fi
+
+        # rc == 2 => there are changes to apply
+        echo "Applying changes..."
         terraform apply -auto-approve tfplan
-        
-        echo "✅ Terraform deployment completed successfully for request $request_id"
 
-    - name: Store State
-      if: success() && steps.extract-info.outputs.request_id != ''
-      run: |
-        environment=${{ steps.extract-info.outputs.environment }}
-        request_id=${{ steps.extract-info.outputs.request_id }}
-        
-        echo "=== Storing Deployment State ==="
-        echo "Request $request_id deployed successfully to $environment"
-        
-        # You can add logic here to:
-        # - Update a database
-        # - Send notifications
-        # - Create deployment records
-        # - Update status in external systems
+        echo "✅ Terraform apply finished for $request_id"
 
-    - name: Notify Success
-      if: success() && steps.extract-info.outputs.request_id != ''
-      run: |
-        request_id=${{ steps.extract-info.outputs.request_id }}
-        environment=${{ steps.extract-info.outputs.environment }}
-        
-        echo "🎉 Deployment successful!"
-        echo "Request ID: $request_id"
-        echo "Environment: $environment"
-        echo "Deployed at: $(date -u)"
+    # keep cleanup / post-checkout steps minimal
+    - name: Finish
+      run: echo "Done"
 
-    - name: Notify Failure
-      if: failure() && steps.extract-info.outputs.request_id != ''
-      run: |
-        request_id=${{ steps.extract-info.outputs.request_id }}
-        environment=${{ steps.extract-info.outputs.environment }}
-        
-        echo "❌ Deployment failed!"
-        echo "Request ID: $request_id"
-        echo "Environment: $environment"
-        echo "Failed at: $(date -u)"
-        
-        # Add failure notification logic here
-        exit 1
 
-    - name: Debug Info on No Match
-      if: steps.extract-info.outputs.request_id == ''
-      run: |
-        echo "=== Debug: No matching tfvars files found ==="
-        echo "This workflow expects files in the pattern:"
-        echo "backend/terraform/environments/aws/<env>/requests/<id>.tfvars"
-        echo ""
-        echo "Current repository structure:"
-        find . -name "*.tfvars" -type f | head -10 || echo "No .tfvars files found"
-        echo ""
-        echo "Recent changes:"
-        git diff --name-only HEAD~1 HEAD || git diff --name-only origin/main HEAD || echo "No changes detected"
