@@ -23,4 +23,4 @@ instance_tags = {
   "RequestID" = "engineering_aws_dev_b270b919"
   "CreatedBy" = "kadimisettimanoharreddy@gmail.com"
   "ManagedBy" = "AIOps-Platform"
-}}
+}
