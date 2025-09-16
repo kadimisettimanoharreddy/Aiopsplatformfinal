@@ -48,3 +48,6 @@ build/
 prometheus_data/
 grafana_data/
 redis_data/
+myenv/
+venv/
+env/
