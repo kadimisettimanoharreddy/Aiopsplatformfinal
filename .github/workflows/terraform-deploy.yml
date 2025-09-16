@@ -4,21 +4,18 @@ on:
   pull_request:
     types: [closed]
     branches: [main]
-    paths: 
-      - 'terraform/environments/**'
-      - 'backend/terraform/environments/**'
+    paths: ['terraform/environments/**']
 
 jobs:
   deploy:
     if: github.event.pull_request.merged == true
     runs-on: ubuntu-latest
-    
+
     steps:
     - name: Checkout
       uses: actions/checkout@v4
       with:
-        fetch-depth: 2
-        token: ${{ secrets.GITHUB_TOKEN }}
+        fetch-depth: 0
 
     - name: Setup Terraform
       uses: hashicorp/setup-terraform@v2
@@ -36,281 +33,48 @@ jobs:
     - name: Extract request info
       id: extract-info
       run: |
-        echo "Starting request info extraction..."
-        changed_files=""
-        
-        # Method 1: Try git diff with HEAD~1
-        if git rev-parse --verify HEAD~1 >/dev/null 2>&1; then
-          echo "Using git diff method..."
-          changed_files=$(git diff --name-only HEAD~1 HEAD | grep -E '\.tfvars || true)
-          echo "Git diff found: $changed_files"
-        fi
-        
-        # Method 2: Use GitHub API to get PR files
-        if [ -z "$changed_files" ] && [ -n "${{ github.event.pull_request.number }}" ]; then
-          echo "Using GitHub API method..."
-          changed_files=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-            -H "Accept: application/vnd.github.v3+json" \
-            "https://api.github.com/repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files" | \
-            jq -r '.[] | select(.filename | test("\\.tfvars$")) | .filename' 2>/dev/null || true)
-          echo "GitHub API found: $changed_files"
-        fi
-        
-        # Method 3: Search for recent tfvars files
+        set -euo pipefail
+
+        # Try to compute changed .tfvars between last commit and HEAD; fallback to origin/main
+        changed_files=$(git diff --name-only HEAD~1 HEAD | grep -E '\.tfvars$' || true)
         if [ -z "$changed_files" ]; then
-          echo "Using file search method..."
-          # Look for tfvars files in both possible locations
-          changed_files=$(find . -name "*.tfvars" -type f | grep -E "(terraform|backend/terraform)/environments/.*/requests/.*\.tfvars$" | head -10 || true)
-          echo "File search found: $changed_files"
+          changed_files=$(git diff --name-only origin/main HEAD | grep -E '\.tfvars$' || true)
         fi
-        
-        # Method 4: Check PR title or branch for request ID
-        if [ -z "$changed_files" ]; then
-          echo "Checking PR branch name: ${{ github.head_ref }}"
-          if [[ "${{ github.head_ref }}" =~ infra-([^-]+)_([^-]+)_([^-]+)_([^-]+) ]]; then
-            dept="${BASH_REMATCH[1]}"
-            cloud="${BASH_REMATCH[2]}"
-            env="${BASH_REMATCH[3]}"
-            request="${BASH_REMATCH[4]}"
-            echo "Extracted from branch: dept=$dept, cloud=$cloud, env=$env, request=$request"
-            
-            # Construct possible file paths
-            possible_files=(
-              "terraform/environments/$cloud/$env/requests/${dept}_${cloud}_${env}_${request}.tfvars"
-              "backend/terraform/environments/$cloud/$env/requests/${dept}_${cloud}_${env}_${request}.tfvars"
-            )
-            
-            for possible_file in "${possible_files[@]}"; do
-              if [ -f "$possible_file" ]; then
-                changed_files="$possible_file"
-                echo "Found file from branch pattern: $possible_file"
-                break
-              fi
-            done
-          fi
-        fi
-        
-        echo "Final changed files: $changed_files"
-        
+
+        echo "changed_files=$changed_files"
+
+        # default empty outputs
+        echo "environment=" >> $GITHUB_OUTPUT
+        echo "request_id=" >> $GITHUB_OUTPUT
+        echo "tfvars_file=" >> $GITHUB_OUTPUT
+
         if [ -n "$changed_files" ]; then
           for file in $changed_files; do
-            echo "Processing file: $file"
-            
-            # Handle both terraform paths
-            if [[ $file =~ (backend/)?terraform/environments/([^/]+)/([^/]+)/requests/([^/]+)\.tfvars ]]; then
-              cloud_provider="${BASH_REMATCH[2]}"
-              environment="${BASH_REMATCH[3]}"
-              request_id="${BASH_REMATCH[4]}"
-              terraform_base="${BASH_REMATCH[1]}terraform"
-              
-              echo "Matched pattern: cloud=$cloud_provider, env=$environment, request=$request_id, base=$terraform_base"
-              
-              if [ -f "$file" ]; then
-                user_email=$(grep -oP 'created_by\s*=\s*"\K[^"]+' "$file" 2>/dev/null || echo "unknown")
-                department=$(grep -oP 'department\s*=\s*"\K[^"]+' "$file" 2>/dev/null || echo "unknown")
-                
-                echo "cloud_provider=$cloud_provider" >> $GITHUB_OUTPUT
-                echo "environment=$environment" >> $GITHUB_OUTPUT
-                echo "request_id=$request_id" >> $GITHUB_OUTPUT
-                echo "user_email=$user_email" >> $GITHUB_OUTPUT
-                echo "department=$department" >> $GITHUB_OUTPUT
-                echo "tfvars_file=$file" >> $GITHUB_OUTPUT
-                echo "terraform_base=$terraform_base" >> $GITHUB_OUTPUT
-                
-                echo "Successfully extracted: cloud=$cloud_provider, env=$environment, id=$request_id, email=$user_email, dept=$department"
-                break
-              else
-                echo "Warning: File $file not found in workspace"
-                ls -la "$(dirname "$file")" 2>/dev/null || echo "Directory $(dirname "$file") does not exist"
-              fi
-            else
-              echo "File $file does not match expected pattern"
+            if [[ $file =~ ^terraform/environments/aws/([^/]+)/requests/([^/]+)\.tfvars$ ]]; then
+              environment="${BASH_REMATCH[1]}"
+              request_id="${BASH_REMATCH[2]}"
+              echo "environment=$environment" >> $GITHUB_OUTPUT
+              echo "request_id=$request_id" >> $GITHUB_OUTPUT
+              echo "tfvars_file=$file" >> $GITHUB_OUTPUT
+              break
             fi
           done
-        else
-          echo "No .tfvars files found in changes"
-          echo "Listing all tfvars files for debugging:"
-          find . -name "*.tfvars" -type f 2>/dev/null || echo "No tfvars files found"
         fi
 
     - name: Deploy Infrastructure
-      if: steps.extract-info.outputs.request_id
+      if: steps.extract-info.outputs.request_id != ''
       run: |
-        cloud_provider=${{ steps.extract-info.outputs.cloud_provider }}
+        set -euo pipefail
+
         environment=${{ steps.extract-info.outputs.environment }}
         request_id=${{ steps.extract-info.outputs.request_id }}
-        terraform_base=${{ steps.extract-info.outputs.terraform_base }}
-        
-        echo "Deploying infrastructure:"
-        echo "  Cloud: $cloud_provider"
-        echo "  Environment: $environment"
-        echo "  Request ID: $request_id"
-        echo "  Terraform base: $terraform_base"
-        
-        # Navigate to the correct terraform directory
-        terraform_dir="${terraform_base}/environments/${cloud_provider}/${environment}"
-        echo "Changing to directory: $terraform_dir"
-        
-        if [ ! -d "$terraform_dir" ]; then
-          echo "Error: Terraform directory $terraform_dir does not exist!"
-          echo "Available directories:"
-          find . -type d -name "*terraform*" 2>/dev/null || echo "No terraform directories found"
-          exit 1
-        fi
-        
-        cd "$terraform_dir"
-        
-        # Verify tfvars file exists
-        tfvars_file="requests/${request_id}.tfvars"
-        if [ ! -f "$tfvars_file" ]; then
-          echo "Error: tfvars file $tfvars_file not found in $(pwd)!"
-          echo "Available files in requests/:"
-          ls -la requests/ 2>/dev/null || echo "requests/ directory does not exist"
-          exit 1
-        fi
-        
-        echo "Found tfvars file: $tfvars_file"
-        echo "Contents:"
-        cat "$tfvars_file"
-        
-        # Initialize Terraform
-        echo "Initializing Terraform..."
-        terraform init
-        
-        # Validate configuration
-        echo "Validating Terraform configuration..."
-        terraform validate
-        
-        # Plan infrastructure
-        echo "Planning infrastructure..."
-        terraform plan -var-file="$tfvars_file" -out=tfplan
-        
-        # Apply infrastructure
-        echo "Applying infrastructure..."
+
+        echo "Deploying request $request_id to environment $environment"
+
+        cd terraform/environments/aws/"$environment"
+
+        terraform init -input=false
+        terraform plan -var-file="requests/${request_id}.tfvars" -out=tfplan
         terraform apply -auto-approve tfplan
-        
-        # Extract outputs
-        echo "Extracting outputs..."
-        instance_id=$(terraform output -raw instance_id 2>/dev/null || echo "")
-        public_ip=$(terraform output -raw public_ip 2>/dev/null || echo "")
-        console_url=$(terraform output -raw console_url 2>/dev/null || echo "")
-        ssh_command=$(terraform output -raw ssh_command 2>/dev/null || echo "")
-        
-        # Get terraform state
-        terraform_state=$(terraform show -json 2>/dev/null || echo "{}")
-        
-        # Set environment variables for subsequent steps
-        echo "instance_id=$instance_id" >> $GITHUB_ENV
-        echo "public_ip=$public_ip" >> $GITHUB_ENV
-        echo "console_url=$console_url" >> $GITHUB_ENV
-        echo "ssh_command=$ssh_command" >> $GITHUB_ENV
-        echo "terraform_state<<EOF" >> $GITHUB_ENV
-        echo "$terraform_state" >> $GITHUB_ENV
-        echo "EOF" >> $GITHUB_ENV
-        
-        echo "Deployment completed successfully!"
-        echo "Instance ID: $instance_id"
-        echo "Public IP: $public_ip"
-        echo "Console URL: $console_url"
-        echo "SSH Command: $ssh_command"
 
-    - name: Store State
-      if: steps.extract-info.outputs.request_id && env.instance_id
-      run: |
-        request_id=${{ steps.extract-info.outputs.request_id }}
-        cloud_provider=${{ steps.extract-info.outputs.cloud_provider }}
-        environment=${{ steps.extract-info.outputs.environment }}
-        
-        echo "Storing state for request: $request_id"
-        
-        # Prepare the API call
-        api_url="${{ secrets.API_URL }}/infrastructure/store-state"
-        
-        if [ -z "$api_url" ] || [ "$api_url" == "/infrastructure/store-state" ]; then
-          echo "Warning: API_URL secret not configured, skipping state storage"
-        else
-          response=$(curl -w "%{http_code}" -s -X POST "$api_url" \
-            -H "Authorization: Bearer ${{ secrets.API_TOKEN }}" \
-            -H "Content-Type: application/json" \
-            -d "{
-              \"request_identifier\": \"$request_id\",
-              \"instance_id\": \"$instance_id\",
-              \"public_ip\": \"$public_ip\",
-              \"console_url\": \"$console_url\",
-              \"ssh_command\": \"$ssh_command\",
-              \"terraform_state\": $(echo \"$terraform_state\" | jq -R -s . 2>/dev/null || echo '\"{}\"'),
-              \"cloud_provider\": \"$cloud_provider\",
-              \"environment\": \"$environment\",
-              \"status\": \"deployed\"
-            }")
-          
-          http_code="${response: -3}"
-          response_body="${response%???}"
-          
-          if [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]; then
-            echo "Successfully stored state (HTTP $http_code)"
-          else
-            echo "Failed to store state (HTTP $http_code): $response_body"
-          fi
-        fi
-
-    - name: Notify Success
-      if: steps.extract-info.outputs.request_id && env.instance_id
-      run: |
-        request_id=${{ steps.extract-info.outputs.request_id }}
-        user_email=${{ steps.extract-info.outputs.user_email }}
-        
-        echo "Sending success notification for request: $request_id to $user_email"
-        
-        api_url="${{ secrets.API_URL }}/infrastructure/notify-deployment"
-        
-        if [ -z "$api_url" ] || [ "$api_url" == "/infrastructure/notify-deployment" ]; then
-          echo "Warning: API_URL secret not configured, skipping notification"
-        else
-          response=$(curl -w "%{http_code}" -s -X POST "$api_url" \
-            -H "Authorization: Bearer ${{ secrets.API_TOKEN }}" \
-            -H "Content-Type: application/json" \
-            -d "{
-              \"request_identifier\": \"$request_id\",
-              \"user_email\": \"$user_email\",
-              \"instance_id\": \"$instance_id\",
-              \"public_ip\": \"$public_ip\",
-              \"console_url\": \"$console_url\",
-              \"ssh_command\": \"$ssh_command\",
-              \"status\": \"deployed\"
-            }")
-          
-          http_code="${response: -3}"
-          response_body="${response%???}"
-          
-          if [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]; then
-            echo "Successfully sent notification (HTTP $http_code)"
-          else
-            echo "Failed to send notification (HTTP $http_code): $response_body"
-          fi
-        fi
-
-    - name: Notify Failure
-      if: failure() && steps.extract-info.outputs.request_id
-      run: |
-        request_id=${{ steps.extract-info.outputs.request_id }}
-        user_email=${{ steps.extract-info.outputs.user_email }}
-        
-        echo "Sending failure notification for request: $request_id to $user_email"
-        
-        api_url="${{ secrets.API_URL }}/infrastructure/notify-deployment"
-        
-        if [ -z "$api_url" ] || [ "$api_url" == "/infrastructure/notify-deployment" ]; then
-          echo "Warning: API_URL secret not configured, skipping failure notification"
-        else
-          curl -X POST "$api_url" \
-            -H "Authorization: Bearer ${{ secrets.API_TOKEN }}" \
-            -H "Content-Type: application/json" \
-            -d "{
-              \"request_identifier\": \"$request_id\",
-              \"user_email\": \"$user_email\",
-              \"status\": \"failed\",
-              \"error_message\": \"Terraform deployment failed - check GitHub Actions logs for details\"
-            }" || echo "Failed to send failure notification"
-        fi
 
