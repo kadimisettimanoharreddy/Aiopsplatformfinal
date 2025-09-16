@@ -24,3 +24,4 @@ instance_tags = {
   "CreatedBy" = "kadimisettimanoharreddy@gmail.com"
   "ManagedBy" = "AIOps-Platform"
 }
+
