@@ -168,19 +168,14 @@ jobs:
           # pull state
           terraform state pull > state.tfstate || echo "{}" > state.tfstate
 
-          # record paths (these relative-to-repo values used when posting)
+          # record paths (absolute) for later upload
           echo "outputs_file=$(pwd)/outputs.json" >> $GITHUB_OUTPUT
           echo "state_file=$(pwd)/state.tfstate" >> $GITHUB_OUTPUT
-          
-          # find tfvars absolute path
+
+          # find tfvars absolute path relative to repo root
           repo_root=$(git rev-parse --show-toplevel)
-          if [[ "$tfvars" == backend/terraform/* ]]; then
-            echo "tfvars_abs=$repo_root/$tfvars" >> $GITHUB_OUTPUT
-            echo "tfvars_repo_path=$tfvars" >> $GITHUB_OUTPUT
-          else
-            echo "tfvars_abs=$repo_root/$tfvars" >> $GITHUB_OUTPUT
-            echo "tfvars_repo_path=$tfvars" >> $GITHUB_OUTPUT
-          fi
+          echo "tfvars_abs=$repo_root/$tfvars" >> $GITHUB_OUTPUT
+          echo "tfvars_repo_path=$tfvars" >> $GITHUB_OUTPUT
 
       - name: Notify backend (deployment success)
         if: success() && steps.detect.outputs.no_tfvars == 'false' && steps.detect.outputs.request_id != ''
@@ -201,7 +196,7 @@ jobs:
           # read outputs (JSON)
           outputs_json=$(cat "$outputs_file" || echo "{}")
 
-          # build payload
+          # build payload with jq
           body=$(jq -n \
             --arg r "$request_id" \
             --arg e "$environment" \
@@ -248,7 +243,7 @@ jobs:
           echo "  Outputs: $outputs_file"
           echo "  Tfvars: $tfvars_abs"
 
-          # Ensure files exist
+          # Ensure files exist (if not, sensors have already created placeholders)
           [ -f "$state_file" ] || { echo "State file not found"; exit 0; }
           [ -f "$outputs_file" ] || { echo "Outputs file not found"; exit 0; }
           [ -f "$tfvars_abs" ] || { echo "Tfvars file not found"; exit 0; }
@@ -282,8 +277,8 @@ jobs:
           api_url="${API_URL%/}"
           notify_endpoint="$api_url/infrastructure/notify-deployment-failed"
 
-          # Capture recent logs from current step
-          log_excerpt=$(tail -n 200 "$GITHUB_STEP_SUMMARY" 2>/dev/null || echo "No log excerpt available")
+          # Capture some logs (if jq not available for heavy JSON use, send simple body)
+          log_excerpt="Terraform run failed. See GitHub Actions logs."
 
           body=$(jq -n \
             --arg r "$request_id" \
