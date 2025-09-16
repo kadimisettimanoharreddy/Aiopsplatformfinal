@@ -1,0 +1,131 @@
+name: Deploy Infrastructure
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+    paths: ['terraform/environments/**']
+
+jobs:
+  deploy:
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v2
+      with:
+        terraform_version: 1.5.0
+        terraform_wrapper: false
+
+    - name: Configure AWS
+      uses: aws-actions/configure-aws-credentials@v2
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: us-east-1
+
+    - name: Extract request info
+      id: extract-info
+      run: |
+        changed_files=$(git diff --name-only HEAD~1 HEAD | grep -E '\.tfvars$' || true)
+        
+        if [ -n "$changed_files" ]; then
+          for file in $changed_files; do
+            if [[ $file =~ terraform/environments/aws/([^/]+)/requests/([^/]+)\.tfvars ]]; then
+              environment="${BASH_REMATCH[1]}"
+              request_id="${BASH_REMATCH[2]}"
+              user_email=$(grep -oP 'created_by = "\K[^"]+' $file)
+              
+              echo "environment=$environment" >> $GITHUB_OUTPUT
+              echo "request_id=$request_id" >> $GITHUB_OUTPUT
+              echo "user_email=$user_email" >> $GITHUB_OUTPUT
+              echo "tfvars_file=$file" >> $GITHUB_OUTPUT
+              break
+            fi
+          done
+        fi
+
+    - name: Deploy Infrastructure
+      if: steps.extract-info.outputs.request_id
+      run: |
+        environment=${{ steps.extract-info.outputs.environment }}
+        request_id=${{ steps.extract-info.outputs.request_id }}
+        
+        cd terraform/environments/aws/$environment
+        
+        terraform init
+        terraform plan -var-file="requests/${request_id}.tfvars" -out=tfplan
+        terraform apply -auto-approve tfplan
+        
+        instance_id=$(terraform output -raw instance_id 2>/dev/null || echo "")
+        public_ip=$(terraform output -raw public_ip 2>/dev/null || echo "")
+        console_url=$(terraform output -raw console_url 2>/dev/null || echo "")
+        ssh_command=$(terraform output -raw ssh_command 2>/dev/null || echo "")
+        terraform_state=$(terraform show -json 2>/dev/null || echo "{}")
+        
+        echo "instance_id=$instance_id" >> $GITHUB_ENV
+        echo "public_ip=$public_ip" >> $GITHUB_ENV
+        echo "console_url=$console_url" >> $GITHUB_ENV
+        echo "ssh_command=$ssh_command" >> $GITHUB_ENV
+        echo "terraform_state<<EOF" >> $GITHUB_ENV
+        echo "$terraform_state" >> $GITHUB_ENV
+        echo "EOF" >> $GITHUB_ENV
+
+    - name: Store State
+      if: steps.extract-info.outputs.request_id && env.instance_id
+      run: |
+        request_id=${{ steps.extract-info.outputs.request_id }}
+        
+        curl -X POST "${{ secrets.API_URL }}/infrastructure/store-state" \
+          -H "Authorization: Bearer ${{ secrets.API_TOKEN }}" \
+          -H "Content-Type: application/json" \
+          -d "{
+            \"request_identifier\": \"$request_id\",
+            \"instance_id\": \"$instance_id\",
+            \"public_ip\": \"$public_ip\",
+            \"console_url\": \"$console_url\",
+            \"ssh_command\": \"$ssh_command\",
+            \"terraform_state\": $(echo \"$terraform_state\" | jq -R -s .),
+            \"cloud_provider\": \"aws\",
+            \"environment\": \"${{ steps.extract-info.outputs.environment }}\",
+            \"status\": \"deployed\"
+          }"
+
+    - name: Notify Success
+      if: steps.extract-info.outputs.request_id && env.instance_id
+      run: |
+        request_id=${{ steps.extract-info.outputs.request_id }}
+        user_email=${{ steps.extract-info.outputs.user_email }}
+        
+        curl -X POST "${{ secrets.API_URL }}/infrastructure/notify-deployment" \
+          -H "Authorization: Bearer ${{ secrets.API_TOKEN }}" \
+          -H "Content-Type: application/json" \
+          -d "{
+            \"request_identifier\": \"$request_id\",
+            \"user_email\": \"$user_email\",
+            \"instance_id\": \"$instance_id\",
+            \"public_ip\": \"$public_ip\",
+            \"console_url\": \"$console_url\",
+            \"ssh_command\": \"$ssh_command\",
+            \"status\": \"deployed\"
+          }"
+
+    - name: Notify Failure
+      if: failure() && steps.extract-info.outputs.request_id
+      run: |
+        request_id=${{ steps.extract-info.outputs.request_id }}
+        user_email=${{ steps.extract-info.outputs.user_email }}
+        
+        curl -X POST "${{ secrets.API_URL }}/infrastructure/notify-deployment" \
+          -H "Authorization: Bearer ${{ secrets.API_TOKEN }}" \
+          -H "Content-Type: application/json" \
+          -d "{
+            \"request_identifier\": \"$request_id\",
+            \"user_email\": \"$user_email\",
+            \"status\": \"failed\",
+            \"error_message\": \"Terraform deployment failed\"
+          }"

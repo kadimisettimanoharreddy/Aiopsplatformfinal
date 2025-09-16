@@ -1,0 +1,157 @@
+import threading
+import json
+import redis
+import time
+import logging
+import asyncio
+from datetime import datetime
+from .config import REDIS_URL
+from .websocket_manager import manager
+from .db_helpers import get_user_email_by_request
+from .database import AsyncSessionLocal
+from .models import InfrastructureRequest, User, UserNotification
+from sqlalchemy.future import select
+
+logger = logging.getLogger(__name__)
+r = redis.from_url(REDIS_URL)
+
+async def store_notification_in_db(user_email: str, request_identifier: str, deployment_details: dict, status: str = "success", terraform_logs: str = None):
+    """Store notification in database for offline users or as backup"""
+    try:
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(
+                select(InfrastructureRequest, User)
+                .join(User, User.id == InfrastructureRequest.user_id)
+                .where(InfrastructureRequest.request_identifier == request_identifier)
+            )
+            row = result.first()
+            
+            if not row:
+                logger.error(f"Request or user not found for {request_identifier}")
+                return
+            
+            infra_request, user = row
+            
+            if status == "success":
+                title = f"Deployment Successful - {deployment_details.get('resource_name', request_identifier)}"
+                message = f"Your {infra_request.resource_type} in {infra_request.environment} is ready!"
+                if deployment_details.get('instance_id'):
+                    message += f" Instance ID: {deployment_details['instance_id']}"
+            else:
+                title = f"Deployment Failed - {deployment_details.get('resource_name', request_identifier)}"
+                message = f"Your {infra_request.resource_type} deployment in {infra_request.environment} failed. Please check logs."
+            
+            notification = UserNotification(
+                user_id=user.id,
+                request_id=infra_request.id,
+                request_identifier=request_identifier,
+                notification_type="deployment",
+                title=title,
+                message=message,
+                status=status,
+                deployment_details=deployment_details,
+                terraform_logs=terraform_logs,
+                is_read=False,
+                created_at=datetime.utcnow()
+            )
+            
+            db.add(notification)
+            await db.commit()
+            
+            logger.info(f"Stored {status} notification for {user_email}, request: {request_identifier}")
+            
+    except Exception as e:
+        logger.error(f"Failed to store notification: {e}")
+
+def handle_message(raw_data: str):
+    try:
+        payload = json.loads(raw_data)
+    except Exception as e:
+        logger.error(f"Failed to parse message: {e}")
+        return
+    
+    request_id = payload.get("request_id") or payload.get("request_identifier")
+    if not request_id:
+        logger.warning("No request_id found in message")
+        return
+    
+    # Determine status from payload
+    status = "success"
+    terraform_logs = None
+    
+    if (payload.get("status") == "failure" or 
+        payload.get("conclusion") == "failure" or 
+        payload.get("error") or 
+        payload.get("failed") or
+        "error" in payload.get("message", "").lower() or
+        "failed" in payload.get("message", "").lower()):
+        status = "failure"
+        terraform_logs = payload.get("terraform_logs") or payload.get("logs") or payload.get("error_details")
+    
+    try:
+        user_identifier = asyncio.run(get_user_email_by_request(request_id))
+    except Exception as e:
+        logger.error(f"Failed to get user email: {e}")
+        user_identifier = None
+    
+    if not user_identifier:
+        logger.warning(f"No user found for request: {request_id}")
+        return
+    
+    deployment_details = {
+        "instance_id": payload.get("instance_id"),
+        "public_ip": payload.get("public_ip"),
+        "console_url": payload.get("console_url"),
+        "ssh_command": payload.get("ssh_command"),
+        "resource_name": payload.get("resource_name", request_id),
+        "status": status,
+        "error_message": payload.get("error_message"),
+        "workflow_run_id": payload.get("workflow_run_id"),
+        "timestamp": datetime.now().isoformat()
+    }
+    
+    # Always store in database first (persistent storage)
+    asyncio.run(store_notification_in_db(user_identifier, request_id, deployment_details, status, terraform_logs))
+    
+    # Then try to send real-time notification if user is online
+    if manager.is_user_connected(user_identifier):
+        try:
+            asyncio.run(manager.send_deployment_notification(user_identifier, request_id, deployment_details))
+            logger.info(f"Sent real-time notification to {user_identifier}")
+        except Exception as e:
+            logger.error(f"Failed to send real-time notification: {e}")
+    else:
+        logger.info(f"User {user_identifier} is offline, notification stored in database")
+
+def _listener():
+    pubsub = r.pubsub(ignore_subscribe_messages=True)
+    pubsub.psubscribe("deployment:*")
+    
+    logger.info("Redis listener started, waiting for deployment messages...")
+    
+    for message in pubsub.listen():
+        try:
+            if not message:
+                continue
+            
+            mtype = message.get("type")
+            if mtype not in ("message", "pmessage"):
+                continue
+            
+            data = message.get("data")
+            if isinstance(data, bytes):
+                data = data.decode("utf-8")
+            
+            logger.debug(f"Received deployment message: {data}")
+            handle_message(data)
+            
+        except Exception as e:
+            logger.error(f"Error processing message: {e}")
+            time.sleep(0.1)
+            continue
+
+def start_listener_in_thread():
+    thread = threading.Thread(target=_listener, daemon=True)
+    thread.start()
+    logger.info("Redis listener thread started")
+    return thread
