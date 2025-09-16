@@ -2,12 +2,15 @@ from pathlib import Path
 from dotenv import load_dotenv
 import os
 
-# load .env from project root (adjust if different)
 BASE_DIR = Path(__file__).resolve().parent.parent
 env_path = BASE_DIR / ".env"
 load_dotenv(dotenv_path=env_path)
 
-# API token
+
+AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
+AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
+AWS_DEFAULT_REGION = os.getenv("AWS_DEFAULT_REGION", "us-east-1")
+
 API_TOKEN = os.getenv("API_TOKEN", "github-actions-service-token-change-in-production")
 
 # Database

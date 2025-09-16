@@ -13,7 +13,6 @@ from .database import SyncSessionLocal
 from .models import InfrastructureRequest, User
 from sqlalchemy import select
 
-# reuse helper to find canonical repo root
 from .terraform_manager import find_repo_root
 
 logger = logging.getLogger(__name__)
@@ -40,7 +39,6 @@ class GitHubManager:
             branch_name = f"infra-{request_identifier}-{timestamp}"
             await self._create_branch(repo_path, branch_name)
 
-            # copy tfvars from canonical workspace into clone if exists, else use generator
             await self._create_terraform_files(repo_path, request_identifier, request_details)
 
             await self._commit_changes(repo_path, request_identifier, request_details)
@@ -92,36 +90,30 @@ class GitHubManager:
         user = request_details["user"]
         params = request_details["parameters"] or {}
 
-        # canonical workspace root (prefer REPO_ROOT env or autodetect)
         repo_root = find_repo_root()
         cloud = (params.get("cloud") or getattr(request, "cloud_provider", "aws")).lower()
         env = (params.get("environment") or getattr(request, "environment", "dev")).lower()
 
-        # determine canonical tfvars path and cloned repo path
         tfvars_name = f"{request_identifier}.tfvars"
         canonical_tfvars = None
         if repo_root:
             canonical_tfvars = repo_root / "terraform" / "environments" / cloud / env / "requests" / tfvars_name
 
-        # ensure clone request dir exists
-        clone_requests_dir = Path(repo_path) / "terraform" / "environments" / cloud / env / "requests"
+        clone_requests_dir = Path(repo_path) / "backend" / "terraform" / "environments" / cloud / env / "requests"
         clone_requests_dir.mkdir(parents=True, exist_ok=True)
         clone_tfvars_path = clone_requests_dir / tfvars_name
 
-        # If canonical tfvars exist, copy from there into clone (preferred)
         if canonical_tfvars and canonical_tfvars.exists():
             shutil.copy2(canonical_tfvars, clone_tfvars_path)
             logger.info("Copied tfvars from canonical workspace: %s -> %s", canonical_tfvars, clone_tfvars_path)
             return
 
-        # If canonical not present, check backend local (current working dir /backend/terraform)
         backend_tfvars = Path.cwd().resolve() / "terraform" / "environments" / cloud / env / "requests" / tfvars_name
         if backend_tfvars.exists():
             shutil.copy2(backend_tfvars, clone_tfvars_path)
             logger.info("Copied tfvars from backend fallback: %s -> %s", backend_tfvars, clone_tfvars_path)
             return
 
-        # fallback: generate tfvars content here in the clone using same generator as TerraformManager
         from .terraform_manager import _render_tfvars_content
         content = _render_tfvars_content(request_identifier, user, params)
         clone_tfvars_path.write_text(content, encoding="utf-8")
@@ -166,7 +158,6 @@ class GitHubManager:
         pr_title = f"[{getattr(request_details['request'],'environment','DEV').upper()}] AWS EC2 - {request_identifier}"
         pr_body = f"Auto generated PR for {request_identifier}\n\nRequested by: {getattr(user,'email','unknown')}\n"
         env = os.environ.copy()
-        # ensure GH token available to `gh` CLI
         env["GH_TOKEN"] = self.github_token or env.get("GH_TOKEN", "")
         proc = await asyncio.create_subprocess_exec("gh", "pr", "create", "--title", pr_title, "--body", pr_body,
                                                     "--base", self.base_branch, "--head", branch_name,
@@ -184,12 +175,8 @@ class GitHubManager:
         return pr_number
 
     def _get_request_details_sync(self, request_identifier: str) -> Dict:
-        """
-        Synchronous database lookup to avoid event loop conflicts in Celery tasks.
-        """
         with SyncSessionLocal() as db:
             try:
-                # Try to get request with user info first
                 result = db.execute(
                     select(InfrastructureRequest, User)
                     .join(User)
@@ -205,7 +192,6 @@ class GitHubManager:
                         "parameters": request.request_parameters
                     }
                 
-                # Fallback: try to get request without user info
                 result = db.execute(
                     select(InfrastructureRequest)
                     .where(InfrastructureRequest.request_identifier == request_identifier)

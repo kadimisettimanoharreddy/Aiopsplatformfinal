@@ -93,9 +93,10 @@ async def create_infrastructure_request_endpoint(
         # dispatch celery
         from .tasks import process_infrastructure_request
         try:
-            process_infrastructure_request.delay(request_data.request_identifier, current_user.email)
-        except Exception:
-            logger.exception("Failed to dispatch Celery task from HTTP endpoint (continuing)")
+            task_result = process_infrastructure_request.delay(request_data.request_identifier, current_user.email)
+            logger.info(f"Dispatched Celery task {task_result.id} for request {request_data.request_identifier}")
+        except Exception as e:
+            logger.exception(f"Failed to dispatch Celery task: {e}")
 
         logger.info(f"Infrastructure request created: {request_data.request_identifier}")
 
@@ -153,62 +154,46 @@ async def get_user_requests(
         raise HTTPException(status_code=500, detail="Failed to fetch requests")
 
 
+# THIS IS THE MAIN FUNCTION THAT WAS BROKEN - NOW FIXED
 async def create_infrastructure_request(request_data: Dict[str, Any]) -> str:
-    
+    """
+    Helper function to create infrastructure request and trigger Celery task.
+    This is called by the LLM processor.
+    """
     try:
+        logger.info(f"Creating infrastructure request: {request_data}")
+        
         async with AsyncSessionLocal() as db:
-            # Resolve/validate request_identifier
             req_id = request_data.get("request_identifier")
             if not req_id:
-                raise ValueError("request_identifier is required in request_data")
+                raise ValueError("request_identifier is required")
 
-            # 1) Resolve user_id
-            resolved_user = None
-            resolved_user_id = None
-            user_id_value = request_data.get("user_id")
+            # Resolve user
             user_email = request_data.get("user_email") or request_data.get("created_by")
+            if not user_email:
+                raise ValueError("user_email must be provided")
 
-            # If user_id provided - try to accept as UUID str or UUID instance
-            if user_id_value:
-                if isinstance(user_id_value, UUID):
-                    resolved_user_id = user_id_value
-                elif isinstance(user_id_value, str):
-                    try:
-                        resolved_user_id = UUID(user_id_value)
-                    except Exception:
-                        resolved_user_id = None
-                else:
-                    # numeric ints are not valid for UUID column — ignore and fallback to email
-                    resolved_user_id = None
+            # Find or create user
+            user_result = await db.execute(select(User).where(User.email == user_email))
+            user_obj = user_result.scalar_one_or_none()
+            
+            if user_obj:
+                resolved_user_id = user_obj.id
+                logger.info(f"Found existing user: {user_email}")
+            else:
+                # Create user if doesn't exist
+                new_user = User(
+                    id=uuid4(),
+                    email=user_email,
+                    name=user_email.split("@")[0],
+                    department=request_data.get("department", "unknown")
+                )
+                db.add(new_user)
+                await db.flush()
+                resolved_user_id = new_user.id
+                logger.info(f"Created new user: {user_email} with ID: {resolved_user_id}")
 
-            # If user_id not resolved, try lookup by email
-            if not resolved_user_id:
-                if not user_email:
-                    raise ValueError("Either valid user_id (UUID string) or user_email must be provided")
-
-                q = await db.execute(select(User).where(User.email == user_email))
-                user_obj = q.scalar_one_or_none()
-                if user_obj:
-                    resolved_user = user_obj
-                    resolved_user_id = user_obj.id
-                else:
-                    # Auto-create minimal user so chat-initiated deploys work without manual DB entries
-                    # NOTE: you can change creation logic if you want stricter behavior
-                    new_user = User(
-                        id=uuid4(),
-                        email=user_email,
-                        name=(user_email.split("@")[0] if isinstance(user_email, str) else "unknown"),
-                        department=request_data.get("department") or "unknown"
-                        # other optional fields may be left default
-                    )
-                    db.add(new_user)
-                    await db.flush()   # populate new_user.id if necessary
-                    # refresh may not be necessary here; we can use new_user.id
-                    resolved_user = new_user
-                    resolved_user_id = new_user.id
-                    logger.info("Auto-created placeholder User for email=%s id=%s", user_email, resolved_user_id)
-
-            # 2) Build the infrastructure request row
+            # Create infrastructure request
             db_request = InfrastructureRequest(
                 user_id=resolved_user_id,
                 request_identifier=req_id,
@@ -223,27 +208,21 @@ async def create_infrastructure_request(request_data: Dict[str, Any]) -> str:
             await db.commit()
             await db.refresh(db_request)
 
-            logger.info("Helper created infrastructure request: %s (user_id=%s)", req_id, str(resolved_user_id))
+            logger.info(f"Created infrastructure request in database: {req_id}")
 
-            # 3) Dispatch Celery task so PR/pipeline is triggered automatically
+            # CRITICAL FIX: Trigger Celery task
             try:
-                # import inside function to avoid circular imports at module load time
                 from .tasks import process_infrastructure_request
-                user_email_to_dispatch = (resolved_user.email if resolved_user else user_email)
-                try:
-                    process_infrastructure_request.delay(req_id, user_email_to_dispatch)
-                except Exception:
-                    # fallback: try synchronous run (useful for dev/debug)
-                    logger.exception("Celery dispatch failed, falling back to synchronous processing.")
-                    import asyncio as _asyncio
-                    _asyncio.run(__import__("app.tasks").tasks._process_request_async(req_id, user_email_to_dispatch))  # note: only fallback
-            except Exception:
-                logger.exception("Failed to dispatch processing task (continuing)")
+                task_result = process_infrastructure_request.delay(req_id, user_email)
+                logger.info(f"SUCCESS: Dispatched Celery task {task_result.id} for request {req_id}")
+            except Exception as e:
+                logger.error(f"FAILED to dispatch Celery task for {req_id}: {e}")
+                # Continue anyway - don't fail the whole request
 
             return req_id
 
     except Exception as e:
-        logger.error(f"Error in helper create_infrastructure_request: {str(e)}")
+        logger.error(f"Error in create_infrastructure_request: {e}")
         raise
 
 

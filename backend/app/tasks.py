@@ -42,13 +42,8 @@ def _run_async_safely(coro_fn, *args, **kwargs):
 
 
 def _update_db_sync(request_identifier: str, pr_number: Optional[int]) -> Dict[str, Any]:
-    """
-    Synchronous database update to avoid asyncio event loop conflicts.
-    This runs in the same thread as Celery task, avoiding the async context issues.
-    """
     try:
         with SyncSessionLocal() as db:
-            # Use synchronous update query
             if pr_number:
                 result = db.execute(
                     update(InfrastructureRequest)
@@ -86,16 +81,9 @@ def health_check() -> str:
 
 @celery_app.task(name="aiops.process_infrastructure_request")
 def process_infrastructure_request(request_identifier: str, user_email: str) -> Dict[str, Any]:
-    """
-    Celery entrypoint:
-    - Perform a short synchronous lookup to ensure the request exists and gather its payload.
-    - Then run the async pipeline in an isolated loop, passing the infra payload so the async code
-      doesn't do the initial SELECT (avoids asyncpg 'another operation is in progress' races).
-    """
     try:
         logger.info("Celery task starting processing: %s", request_identifier)
 
-        # 1) sync lookup (safe in Celery synchronous context)
         try:
             infra_row = get_infra_sync(request_identifier)
         except Exception as e:
@@ -106,8 +94,6 @@ def process_infrastructure_request(request_identifier: str, user_email: str) -> 
             logger.error("Request %s not found (sync lookup)", request_identifier)
             return {"request_identifier": request_identifier, "status": "failed", "error": "request-not-found"}
 
-        # Convert the ORM object to a serializable payload with the fields the async pipeline needs.
-        # Adjust field names here if your InfrastructureRequest model stores them differently.
         infra_payload = {
             "id": getattr(infra_row, "id", None),
             "request_identifier": getattr(infra_row, "request_identifier", request_identifier),
@@ -118,10 +104,8 @@ def process_infrastructure_request(request_identifier: str, user_email: str) -> 
             "created_at": getattr(infra_row, "created_at", None),
         }
 
-        # 2) Run the async orchestration without doing the initial DB select
         result = _run_async_safely(_process_request_async, request_identifier, user_email, infra_payload)
         
-        # 3) Update database synchronously after async operations complete
         pr_number = result.get("pr_number")
         db_result = _update_db_sync(request_identifier, pr_number)
         result.update(db_result)
@@ -135,15 +119,6 @@ def process_infrastructure_request(request_identifier: str, user_email: str) -> 
 
 
 async def _process_request_async(request_identifier: str, user_email: str, infra_payload: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Async orchestration pipeline.
-    This function RECEIVES the infra_payload (from sync lookup) and DOES NOT perform the initial DB SELECT.
-    It continues to:
-      - generate TFVARS,
-      - create Github PR,
-      - notify API and publish Redis.
-    Note: Database update is now handled synchronously in the main Celery task.
-    """
     try:
         logger.info("Running _process_request_async on loop %s", asyncio.get_running_loop())
     except Exception:
@@ -151,15 +126,29 @@ async def _process_request_async(request_identifier: str, user_email: str, infra
 
     result_payload: Dict[str, Any] = {"request_identifier": request_identifier, "status": "failed"}
 
-    # infra_payload is trusted source from sync lookup
     infra = infra_payload
 
-    # 1) Generate TFVARS locally into canonical repo workspace
     try:
+        user_obj = None
+        if infra.get("user_id"):
+            try:
+                async with AsyncSessionLocal() as db:
+                    from .models import User
+                    user_result = await db.execute(select(User).where(User.id == infra["user_id"]))
+                    user_obj = user_result.scalar_one_or_none()
+            except Exception as e:
+                logger.warning(f"Could not fetch user object: {e}")
+        
         tm_mod = importlib.import_module("app.terraform_manager")
         TerraformManager = getattr(tm_mod, "TerraformManager")
         tm = TerraformManager()
-        backend_path, clone_expected_path = await tm.generate_tfvars_for_request(request_identifier, request_obj=infra)
+        
+        backend_path, clone_expected_path = await tm.generate_tfvars_for_request(
+            request_identifier, 
+            params=infra.get("request_parameters", {}),
+            user=user_obj,
+            request_obj=infra
+        )
         result_payload["tfvars_written"] = True
         result_payload["tfvars_backend_path"] = str(backend_path)
         result_payload["tfvars_repo_path"] = str(clone_expected_path) if clone_expected_path else None
@@ -168,9 +157,7 @@ async def _process_request_async(request_identifier: str, user_email: str, infra
         logger.exception("Terraform tfvars generation failed for %s: %s", request_identifier, e)
         result_payload["tfvars_written"] = False
         result_payload["error"] = "tfvars_generation_failed:" + str(e)
-        # continue to attempt PR creation (PR logic may generate tfvars itself)
 
-    # 2) Create GitHub PR (clone remote, copy tfvars into clone, commit, push, create PR)
     pr_number: Optional[int] = None
     try:
         gh_mod = importlib.import_module("app.github_manager")
@@ -185,9 +172,6 @@ async def _process_request_async(request_identifier: str, user_email: str, infra
         result_payload["error"] = "pr_creation_failed:" + str(e)
         result_payload["status"] = "failed"
 
-    # 3) Database update is now handled synchronously in the main task
-
-    # 4) Notify API (if configured)
     try:
         if API_URL and API_TOKEN:
             notify_url = f"{API_URL.rstrip('/')}/infrastructure/notify-deployment"
@@ -213,7 +197,6 @@ async def _process_request_async(request_identifier: str, user_email: str, infra
         logger.exception("Failed to notify user API")
         result_payload["notify_error"] = str(e)
 
-    # 5) Publish Redis pubsub for frontend websocket or listeners
     try:
         if _redis_client:
             channel = f"deployment:{request_identifier}"
