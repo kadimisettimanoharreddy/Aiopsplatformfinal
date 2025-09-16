@@ -1,0 +1,26 @@
+request_id = "engineering_aws_dev_2634f492"
+department = "unknown"
+created_by = "system@aiops-platform.com"
+environment = "dev"
+instance_type = "t3.medium"
+storage_size = 8
+region = "us-east-1"
+associate_public_ip = true
+ami_filter = "ubuntu/images/hvm-ssd/ubuntu-focal-20.04-amd64-server-*"
+ami_owners = ["099720109477"]
+key_name = "auto-Engineering-e84290"
+create_new_keypair = true
+vpc_id = ""
+use_existing_vpc = false
+subnet_id = ""
+use_existing_subnet = false
+security_group_id = ""
+use_existing_sg = false
+instance_tags = {
+  "Name" = "system-ec2-2634f492"
+  "Department" = "unknown"
+  "Environment" = "dev"
+  "RequestID" = "engineering_aws_dev_2634f492"
+  "CreatedBy" = "system@aiops-platform.com"
+  "ManagedBy" = "AIOps-Platform"
+}
