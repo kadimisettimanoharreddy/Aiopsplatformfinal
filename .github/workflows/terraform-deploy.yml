@@ -156,11 +156,8 @@ jobs:
           # determine base dir again
           if [[ "$tfvars" == backend/terraform/* ]]; then
             base="backend/terraform/environments/aws/$environment"
-            tfvars_rel="requests/${request_id}.tfvars"
-            tfvars_abs="$(pwd)/../.."/"$tfvars" || true
           else
             base="terraform/environments/aws/$environment"
-            tfvars_rel="requests/${request_id}.tfvars"
           fi
 
           cd "$base"
@@ -174,21 +171,15 @@ jobs:
           # record paths (these relative-to-repo values used when posting)
           echo "outputs_file=$(pwd)/outputs.json" >> $GITHUB_OUTPUT
           echo "state_file=$(pwd)/state.tfstate" >> $GITHUB_OUTPUT
-          # we also expose the tfvars path used (relative to repo root)
-          # find absolute tfvars path by looking at repo structure
+          
+          # find tfvars absolute path
           repo_root=$(git rev-parse --show-toplevel)
-          # try both possible tfvars absolute candidates
-          if [ -f "$repo_root/$tfvars" ]; then
-            echo "tfvars_repo_path=$tfvars" >> $GITHUB_OUTPUT
+          if [[ "$tfvars" == backend/terraform/* ]]; then
             echo "tfvars_abs=$repo_root/$tfvars" >> $GITHUB_OUTPUT
-          elif [ -f "$repo_root/$base/$tfvars_rel" ]; then
-            # when tfvars file is inside the chosen base
-            relpath="$base/$tfvars_rel"
-            echo "tfvars_repo_path=$relpath" >> $GITHUB_OUTPUT
-            echo "tfvars_abs=$repo_root/$relpath" >> $GITHUB_OUTPUT
-          else
             echo "tfvars_repo_path=$tfvars" >> $GITHUB_OUTPUT
-            echo "tfvars_abs=" >> $GITHUB_OUTPUT
+          else
+            echo "tfvars_abs=$repo_root/$tfvars" >> $GITHUB_OUTPUT
+            echo "tfvars_repo_path=$tfvars" >> $GITHUB_OUTPUT
           fi
 
       - name: Notify backend (deployment success)
@@ -202,24 +193,27 @@ jobs:
           request_id="${{ steps.detect.outputs.request_id }}"
           environment="${{ steps.detect.outputs.environment }}"
           outputs_file="${{ steps.collect.outputs.outputs_file }}"
-          state_file="${{ steps.collect.outputs.state_file }}"
           tfvars_repo_path="${{ steps.collect.outputs.tfvars_repo_path }}"
 
-          api_url="${API_URL%/}"   # strip trailing slash if any
+          api_url="${API_URL%/}"
           notify_endpoint="$api_url/infrastructure/notify-deployment"
 
           # read outputs (JSON)
           outputs_json=$(cat "$outputs_file" || echo "{}")
 
           # build payload
-          read -r -d '' payload <<EOF || true
-{
-  "request_id": "${request_id}",
-  "environment": "${environment}",
-  "tfvars": "${tfvars_repo_path}",
-  "outputs": ${outputs_json}
-}
-EOF
+          body=$(jq -n \
+            --arg r "$request_id" \
+            --arg e "$environment" \
+            --arg t "$tfvars_repo_path" \
+            --argjson o "$outputs_json" \
+            '{
+              "request_id": $r,
+              "environment": $e,
+              "tfvars": $t,
+              "outputs": $o
+            }'
+          )
 
           echo "Posting deployment notification to $notify_endpoint"
           headers=(-H "Content-Type: application/json")
@@ -227,13 +221,12 @@ EOF
             headers+=(-H "Authorization: Bearer $API_TOKEN")
           fi
 
-          # send notification (do not fail whole job if backend refuses)
-          curl --fail -sS "${headers[@]}" -X POST "$notify_endpoint" -d "$payload" || {
+          curl --fail -sS "${headers[@]}" -X POST "$notify_endpoint" -d "$body" || {
             echo "Warning: notify-deployment request failed"
             exit 0
           }
 
-      - name: Upload tfvars + state to backend (archive)
+      - name: Upload terraform files to backend
         if: success() && steps.detect.outputs.no_tfvars == 'false' && steps.detect.outputs.request_id != ''
         continue-on-error: true
         env:
@@ -241,68 +234,40 @@ EOF
           API_TOKEN: ${{ env.API_TOKEN }}
         run: |
           set -euo pipefail
-          api_url="${API_URL%/}"
-          upload_endpoint="$api_url/infrastructure/upload-terraform"
           request_id="${{ steps.detect.outputs.request_id }}"
           environment="${{ steps.detect.outputs.environment }}"
-
           outputs_file="${{ steps.collect.outputs.outputs_file }}"
           state_file="${{ steps.collect.outputs.state_file }}"
           tfvars_abs="${{ steps.collect.outputs.tfvars_abs }}"
 
-          # Ensure files exist (they should)
-          [ -f "$state_file" ] || echo "{}" > "$state_file"
-          [ -f "$outputs_file" ] || echo "{}" > "$outputs_file"
+          api_url="${API_URL%/}"
+          upload_endpoint="$api_url/infrastructure/upload-terraform"
 
-          # If tfvars_abs is empty or not present, attempt locate in repo
-          if [ -z "$tfvars_abs" ] || [ ! -f "$tfvars_abs" ]; then
-            # try repo-relative common paths
-            repo_root=$(git rev-parse --show-toplevel)
-            cand="$repo_root/terraform/environments/aws/$environment/requests/$request_id.tfvars"
-            if [ -f "$cand" ]; then
-              tfvars_abs="$cand"
-            else
-              cand2="$repo_root/backend/terraform/environments/aws/$environment/requests/$request_id.tfvars"
-              if [ -f "$cand2" ]; then
-                tfvars_abs="$cand2"
-              fi
-            fi
+          echo "Uploading Terraform files to backend:"
+          echo "  State: $state_file"
+          echo "  Outputs: $outputs_file"
+          echo "  Tfvars: $tfvars_abs"
+
+          # Ensure files exist
+          [ -f "$state_file" ] || { echo "State file not found"; exit 0; }
+          [ -f "$outputs_file" ] || { echo "Outputs file not found"; exit 0; }
+          [ -f "$tfvars_abs" ] || { echo "Tfvars file not found"; exit 0; }
+
+          headers=()
+          if [ -n "$API_TOKEN" ]; then
+            headers+=(-H "Authorization: Bearer $API_TOKEN")
           fi
 
-          # fallback create small body if tfvars not found
-          if [ -f "$tfvars_abs" ]; then
-            echo "Uploading tfvars and state to $upload_endpoint"
-            headers=(-H "Accept: application/json")
-            if [ -n "$API_TOKEN" ]; then
-              headers+=(-H "Authorization: Bearer $API_TOKEN")
-            fi
-
-            curl --fail -sS "${headers[@]}" \
-              -F "request_id=${request_id}" \
-              -F "environment=${environment}" \
-              -F "tfvars_file=@${tfvars_abs}" \
-              -F "state_file=@${state_file}" \
-              -F "outputs_file=@${outputs_file}" \
-              "$upload_endpoint" || {
-                echo "Warning: upload-terraform request failed"
-                exit 0
-              }
-          else
-            echo "Warning: tfvars file not found for upload; sending state and outputs only"
-            headers=(-H "Accept: application/json")
-            if [ -n "$API_TOKEN" ]; then
-              headers+=(-H "Authorization: Bearer $API_TOKEN")
-            fi
-            curl --fail -sS "${headers[@]}" \
-              -F "request_id=${request_id}" \
-              -F "environment=${environment}" \
-              -F "state_file=@${state_file}" \
-              -F "outputs_file=@${outputs_file}" \
-              "$upload_endpoint" || {
-                echo "Warning: upload-terraform request failed"
-                exit 0
-              }
-          fi
+          curl --fail -sS "${headers[@]}" \
+            -F "request_id=$request_id" \
+            -F "environment=$environment" \
+            -F "state_file=@$state_file" \
+            -F "outputs_file=@$outputs_file" \
+            -F "tfvars_file=@$tfvars_abs" \
+            "$upload_endpoint" || {
+              echo "Warning: upload-terraform request failed"
+              exit 0
+            }
 
       - name: Notify backend (failure)
         if: failure() && steps.detect.outputs.no_tfvars == 'false' && steps.detect.outputs.request_id != ''
@@ -317,10 +282,20 @@ EOF
           api_url="${API_URL%/}"
           notify_endpoint="$api_url/infrastructure/notify-deployment-failed"
 
-          # capture last 200 lines of logs as message
-          log_excerpt=$(tail -n 200 "$GITHUB_WORKSPACE/.github/workflows/deploy-infrastructure.yml" 2>/dev/null || true)
+          # Capture recent logs from current step
+          log_excerpt=$(tail -n 200 "$GITHUB_STEP_SUMMARY" 2>/dev/null || echo "No log excerpt available")
 
-          body=$( jq -n --arg r "$request_id" --arg e "$environment" --arg m "$log_excerpt" '{request_id:$r, environment:$e, message:$m}' )
+          body=$(jq -n \
+            --arg r "$request_id" \
+            --arg e "$environment" \
+            --arg m "$log_excerpt" \
+            '{
+              "request_id": $r,
+              "environment": $e,
+              "message": $m
+            }'
+          )
+
           headers=(-H "Content-Type: application/json")
           if [ -n "$API_TOKEN" ]; then
             headers+=(-H "Authorization: Bearer $API_TOKEN")
@@ -332,7 +307,7 @@ EOF
           }
 
       - name: Finish
-        run: echo "Done"
+        run: echo "Deployment workflow completed"
 
 
 
