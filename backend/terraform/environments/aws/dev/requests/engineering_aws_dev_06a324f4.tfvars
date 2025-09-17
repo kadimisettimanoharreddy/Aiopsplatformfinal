@@ -1,0 +1,26 @@
+request_id = "engineering_aws_dev_06a324f4"
+department = "Engineering"
+created_by = "kadimisettimanoharreddy@gmail.com"
+environment = "dev"
+instance_type = "t3.micro"
+storage_size = 8
+region = "us-east-1"
+associate_public_ip = true
+ami_filter = "ubuntu/images/hvm-ssd/ubuntu-focal-20.04-amd64-server-*"
+ami_owners = ["099720109477"]
+key_name = "auto-Engineering-3aa9ca"
+create_new_keypair = true
+vpc_id = ""
+use_existing_vpc = false
+subnet_id = ""
+use_existing_subnet = false
+security_group_id = ""
+use_existing_sg = false
+instance_tags = {
+  "Name" = "manohar-ec2-06a324f4"
+  "Department" = "Engineering"
+  "Environment" = "dev"
+  "RequestID" = "engineering_aws_dev_06a324f4"
+  "CreatedBy" = "kadimisettimanoharreddy@gmail.com"
+  "ManagedBy" = "AIOps-Platform"
+}
