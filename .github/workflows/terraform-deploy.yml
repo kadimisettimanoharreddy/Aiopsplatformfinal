@@ -14,8 +14,8 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      API_URL: ${{ secrets.API_URL }}          # e.g. https://b5c78943d402.ngrok-free.app
-      API_TOKEN: ${{ secrets.API_TOKEN }}      # optional, used as Bearer token if set
+      API_URL: ${{ secrets.API_URL }}          
+      API_TOKEN: ${{ secrets.API_TOKEN }}      
       AWS_REGION: us-east-1
 
     steps:
